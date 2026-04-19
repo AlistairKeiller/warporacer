@@ -156,8 +156,12 @@ def vehicle_dynamics_st(
 
 @wp.kernel
 def step(
-    cars: wp.array2d[float],
     actions: wp.array[wp.vec2],
+    observation: wp.array2d[float],
+    reward: wp.array[float],
+    truncated: wp.array[bool],
+    terminated: wp.array[bool],
+    cars: wp.array2d[float],
     origin: wp.vec2,
     res: float,
     distance_transform_px: wp.array2d[float],
@@ -165,7 +169,6 @@ def step(
     centerline: wp.array[wp.vec3],
     num_centerline_pts: int,
     lidar_dirs: wp.array[wp.vec2],
-    observation: wp.array2d[float],
 ):
     i = wp.tid()
 
@@ -295,8 +298,8 @@ class Map:
         raw = imread(str(path.parent / self.meta["image"]), IMREAD_GRAYSCALE)
         if raw is None:
             raise FileNotFoundError(path.parent / self.meta["image"])
-        self.occupied = wp.array(raw < OCC_THRESH, dtype=wp.float32)
-        self.dt = wp.array(distance_transform_edt(raw >= OCC_THRESH), dtype=wp.float32)
+        self.occupied = raw < OCC_THRESH
+        self.dt = distance_transform_edt(raw >= OCC_THRESH)
         self.ox, self.oy, self.ophi = self.meta["origin"]
         self.h, self.w = self.occupied.shape
         self.res = float(self.meta["resolution"])
@@ -312,10 +315,8 @@ class Map:
 
             centerline_px = np.column_stack(
                 [
-                    (self.centerline[:, 0] - self.ox) / self.res,  # col (x in image)
-                    self.h
-                    - 1
-                    - (self.centerline[:, 1] - self.oy) / self.res,  # row (y in image)
+                    (self.centerline[:, 0] - self.ox) / self.res,
+                    self.h - 1 - (self.centerline[:, 1] - self.oy) / self.res,
                 ]
             )
             rr.log("image/world/centerline", rr.Points2D(centerline_px, radii=1.0))
@@ -325,50 +326,43 @@ class Map:
 
     def _compute_centerline(self, raw, smooth_window=SMOOTH_WINDOW):
         skeleton = skeletonize(raw >= OCC_THRESH)
-        skeleton_points = np.argwhere(skeleton)
 
-        def neighbors(p):
-            return (
-                (int(p[0] + d[0]), int(p[1] + d[1]))
-                for d in ADJ
-                if 0 <= p[0] + d[0] < self.h
-                and 0 <= p[1] + d[1] < self.w
-                and skeleton[p[0] + d[0], p[1] + d[1]]
-            )
+        pts = np.argwhere(skeleton)
+        origin_px = [self.h - 1 + self.oy / self.res, -self.ox / self.res]
+        start = tuple(pts[np.argmin(np.linalg.norm(pts - origin_px, axis=1))])
 
-        origin_row = self.h - 1 + self.oy / self.res
-        origin_col = -self.ox / self.res
-        start_idx = np.argmin(
-            np.linalg.norm(skeleton_points - np.array((origin_row, origin_col)), axis=1)
-        )
-        start = tuple(skeleton_points[start_idx])
-        starting_neighbors = list(neighbors(start))
-        src, targets = starting_neighbors[0], starting_neighbors[1:]
+        nbrs = [
+            (start[0] + dr, start[1] + dc)
+            for dr, dc in ADJ
+            if skeleton[start[0] + dr, start[1] + dc]
+        ]
+        src, target = nbrs[0], nbrs[1]
         parent = {src: src}
         q = deque([src])
-        found = None
-        while q and found is None:
-            cur = q.popleft()
-            for n in neighbors(cur):
-                if n not in parent and n != start:
-                    parent[n] = cur
-                    q.append(n)
-                    if n in targets:
-                        found = n
+        while q:
+            r, c = q.popleft()
+            for dr, dc in ADJ:
+                n = (r + dr, c + dc)
+                if skeleton[n] and n not in parent and n != start:
+                    parent[n] = (r, c)
+                    if n == target:
+                        q.clear()
                         break
+                    q.append(n)
 
         path = [start]
-        p = found
-        while p != src:
-            path.append(p)
-            p = parent[p]
+        n = target
+        while n != src:
+            path.append(n)
+            n = parent[n]
         path.append(src)
         path.reverse()
 
-        world = np.array(
+        rc = np.array(path)
+        world = np.column_stack(
             [
-                (self.ox + c * self.res, self.oy + (self.h - 1 - r) * self.res)
-                for r, c in path
+                self.ox + rc[:, 1] * self.res,
+                self.oy + (self.h - 1 - rc[:, 0]) * self.res,
             ]
         )
         self.centerline = savgol_filter(world, smooth_window, 3, axis=0, mode="wrap")
@@ -385,12 +379,9 @@ class Map:
         )
         kdtree = KDTree(centerline_px)
         rows, cols = np.mgrid[: self.h, : self.w]
-        self.centerline_lut = wp.array(
-            kdtree.query(np.column_stack([rows.ravel(), cols.ravel()]), workers=-1)[
-                1
-            ].reshape(rows.shape),
-            dtype=wp.float32,
-        )
+        self.centerline_lut = kdtree.query(
+            np.column_stack([rows.ravel(), cols.ravel()]), workers=-1
+        )[1].reshape(rows.shape)
 
 
 def main(yaml_path: Path):
