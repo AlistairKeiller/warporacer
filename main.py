@@ -7,6 +7,7 @@ import warp as wp
 from cv2 import IMREAD_GRAYSCALE, imread
 from scipy.ndimage import distance_transform_edt
 from scipy.signal import savgol_filter
+from scipy.spatial import KDTree
 from skimage.morphology import skeletonize
 from typer import run
 from yaml import safe_load
@@ -159,9 +160,11 @@ def step(
     actions: wp.array[wp.vec2],
     origin: wp.vec2,
     res: float,
-    dt_px: wp.array2d[float],
+    distance_transform_px: wp.array2d[float],
+    centerline_lut: wp.array2d[float],
+    centerline: wp.array[wp.vec3],
     lidar_dirs: wp.array[wp.vec2],
-    lidar_ranges: wp.array2d[float],
+    observation: wp.array2d[float],
 ):
     i = wp.tid()
 
@@ -179,7 +182,7 @@ def step(
     origin_y = origin[1]
 
     # width_px = dt_px.size[0]
-    height_px = dt_px.size[1]
+    height_px = distance_transform_px.size[1]
 
     car_px = (car_x - origin_x) / res
     car_py = height_px - 1 - (car_y - origin_y) / res
@@ -233,50 +236,55 @@ def step(
     cars[i, 4] += (k1.d_psi + 2.0 * k2.d_psi + 2.0 * k3.d_psi + k4.d_psi) * DT / 6.0
     cars[i, 5] += (k1.dd_psi + 2.0 * k2.dd_psi + 2.0 * k3.dd_psi + k4.dd_psi) * DT / 6.0
     cars[i, 6] += (k1.d_beta + 2.0 * k2.d_beta + 2.0 * k3.d_beta + k4.d_beta) * DT / 6.0
+    observation[i, 0] = cars[i, 2]
+    observation[i, 1] = cars[i, 3]
+    observation[i, 2] = cars[i, 5]
 
     # collision logic
-    term = dt_px[car_px, car_py] * res < wp.length(wp.vec2([WIDTH / 2, LENGTH / 2]))
+    term = distance_transform_px[car_px, car_py] * res < wp.length(
+        wp.vec2([WIDTH / 2, LENGTH / 2])
+    )
     trunc = car_step >= MAX_STEPS
     cars[i, 7] += 1
 
     # reward logic
-    new_centerline_pt =
+    new_centerline_pt = centerline_lut[car_px, car_py]
+    cars[i, 8] = new_centerline_pt
+    d_centerline_pt = new_centerline_pt - car_centerline_pt
+    if d_centerline_pt > num_centerline_pts / 2:
+        d_centerline_pt -= num_centerline_pts
+    elif d_centerline_pt < -num_centerline_pts / 2:
+        d_centerline_pt += num_centerline_pts
+    reward = d_centerline_pt / num_centerline_pts - term
 
-# def car_colides(
-#     car: wp.vec3, origin: wp.vec2, res: float, dt: wp.array2d[float]
-# ) -> bool:
-#     car_px = (car[0] - origin[0]) / res
-#     car_py = dt.size[1] - 1 - (car[1] - origin[1]) / res
+    # reset logic
+    if trunc or term:
+        random_number = 0  # TOOD: generate a random number
+        cars[i, 0] = centerline[random_number, 0]
+        cars[i, 1] = centerline[random_number, 1]
+        cars[i, 2] = 0.0
+        cars[i, 3] = 0.0
+        cars[i, 4] = centerline[random_number, 4]
+        cars[i, 5] = 0.0
+        cars[i, 6] = 0.0
+        cars[i, 7] = 0.0
+        cars[i, 8] = random_number
 
-
-# @wp.kernel
-# def scan_lidars(
-#     cars: wp.array[wp.vec3],
-#     origin: wp.vec2,
-#     res: float,
-#     dt: wp.array2d[float],
-#     lidar_dirs: wp.array[wp.vec2],
-#     max_distance: float,
-#     lidar_ranges: wp.array2d[float],
-# ):
-#     i = wp.tid()
-#     car = cars[i]
-#     car_px = (car[0] - origin[0]) / res
-#     car_py = dt.size[1] - 1 - (car[1] - origin[1]) / res
-#     car_phi = car[2]
-#     ray = wp.vec2(car_px, car_py)
-#     sh, ch = wp.sin(car_phi), wp.cos(car_phi)
-#     for j in range(len(lidar_dirs)):
-#         ca, sa = lidar_dirs[j]
-#         d_px = wp.vec2(ch * ca - sh * sa, sh * ca + ch * sa)
-#         while wp.length(ray - wp.vec2(car_px, car_py)) < max_distance:
-#             ray_px = wp.int32(ray[0])
-#             ray_py = wp.int32(ray[1])
-#             dt_ray = dt[ray_px, ray_py]
-#             ray += d_px * dt_ray
-#             if dt_ray == 0.0:
-#                 lidar_ranges[i, j] = wp.length(ray - wp.vec2(car_px, car_py))
-#                 break
+    # raycast
+    ray = wp.vec2(car_px, car_py)
+    sh, ch = wp.sin(car_phi), wp.cos(car_phi)
+    for j in range(len(lidar_dirs)):
+        ca = lidar_dirs[j, 0]
+        sa = lidar_dirs[j, 1]
+        d_px = wp.vec2(ch * ca - sh * sa, sh * ca + ch * sa)
+        while wp.length(ray - wp.vec2(car_px, car_py)) < LIDAR_RANGE:
+            ray_px = wp.int32(ray[0])
+            ray_py = wp.int32(ray[1])
+            dt_ray = distance_transform_px[ray_px, ray_py]
+            ray += d_px * dt_ray
+            if dt_ray == 0.0:
+                observation[i, j + 3] = wp.length(ray - wp.vec2(car_px, car_py))
+                break
 
 
 class Map:
@@ -292,6 +300,7 @@ class Map:
         self.h, self.w = self.occupied.shape
         self.res = float(self.meta["resolution"])
         self._compute_centerline(raw)
+        self._build_lut()
 
     def _compute_centerline(self, raw, smooth_window=SMOOTH_WINDOW):
         skeleton = skeletonize(raw >= OCC_THRESH)
@@ -299,7 +308,7 @@ class Map:
 
         def neighbors(p):
             return (
-                (p[0] + d[0], p[1] + d[1])
+                (int(p[0] + d[0]), int(p[1] + d[1]))
                 for d in ADJ
                 if 0 <= p[0] + d[0] < self.h
                 and 0 <= p[1] + d[1] < self.w
@@ -308,10 +317,11 @@ class Map:
 
         origin_row = self.h - 1 + self.oy / self.res
         origin_col = -self.ox / self.res
-        start = np.argmin(
+        start_idx = np.argmin(
             np.linalg.norm(skeleton_points - np.array((origin_row, origin_col)), axis=1)
         )
-        starting_neighbors = list(neighbors(skeleton_points[start]))
+        start = tuple(skeleton_points[start_idx])
+        starting_neighbors = list(neighbors(start))
         src, targets = starting_neighbors[0], starting_neighbors[1:]
         parent = {src: src}
         q = deque([src])
@@ -335,13 +345,30 @@ class Map:
         path.reverse()
 
         world = np.array(
-            (self.ox + c * self.res, self.oy + (self.h - 1 - r) * self.res)
-            for r, c in path
+            [
+                (self.ox + c * self.res, self.oy + (self.h - 1 - r) * self.res)
+                for r, c in path
+            ]
         )
         self.centerline = savgol_filter(world, smooth_window, 3, axis=0, mode="wrap")
         self.diffs = np.diff(self.centerline, axis=0, append=self.centerline[:1])
         self.angles = np.arctan2(self.diffs[:, 1], self.diffs[:, 0])
         self.cum_dist = np.cumsum(np.linalg.norm(self.diffs, axis=1))
+
+    def _build_lut(self):
+        centerline_px = np.array(
+            [
+                (self.centerline[:, 0] - self.ox) / self.res,
+                self.h - 1 - (self.centerline[:, 1] - self.oy) / self.res,
+            ]
+        ).T
+        kdtree = KDTree(centerline_px)
+        rows, cols = np.mgrid[: self.h, : self.w]
+        self.centerline_lut = wp.array(
+            kdtree.query(np.column_stack([rows.ravel(), cols.ravel()]))[0].reshape(
+                rows.shape
+            )
+        )
 
 
 def main(yaml_path: Path):
