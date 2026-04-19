@@ -163,6 +163,7 @@ def step(
     distance_transform_px: wp.array2d[float],
     centerline_lut: wp.array2d[float],
     centerline: wp.array[wp.vec3],
+    num_centerline_pts: int,
     lidar_dirs: wp.array[wp.vec2],
     observation: wp.array2d[float],
 ):
@@ -186,8 +187,8 @@ def step(
 
     car_px = (car_x - origin_x) / res
     car_py = height_px - 1 - (car_y - origin_y) / res
+    car_pos_px = wp.vec2(car_px, car_py)
 
-    # step logic
     steer_v = wp.clamp(actions[i, 0] * STEER_V_MAX, STEER_V_MIN, STEER_V_MAX)
     if steer_v < 0 and car_delta <= STEER_MIN or steer_v > 0 and car_delta >= STEER_MAX:
         steer_v = 0
@@ -264,7 +265,7 @@ def step(
         cars[i, 1] = centerline[random_number, 1]
         cars[i, 2] = 0.0
         cars[i, 3] = 0.0
-        cars[i, 4] = centerline[random_number, 4]
+        cars[i, 4] = centerline[random_number, 2]
         cars[i, 5] = 0.0
         cars[i, 6] = 0.0
         cars[i, 7] = 0.0
@@ -272,19 +273,19 @@ def step(
 
     # raycast
     ray = wp.vec2(car_px, car_py)
-    sh, ch = wp.sin(car_phi), wp.cos(car_phi)
+    sh, ch = wp.sin(car_psi), wp.cos(car_psi)
     for j in range(len(lidar_dirs)):
         ca = lidar_dirs[j, 0]
         sa = lidar_dirs[j, 1]
         d_px = wp.vec2(ch * ca - sh * sa, sh * ca + ch * sa)
-        while wp.length(ray - wp.vec2(car_px, car_py)) < LIDAR_RANGE:
+        while wp.length(ray - car_pos_px) < LIDAR_RANGE:
             ray_px = wp.int32(ray[0])
             ray_py = wp.int32(ray[1])
             dt_ray = distance_transform_px[ray_px, ray_py]
             ray += d_px * dt_ray
             if dt_ray == 0.0:
-                observation[i, j + 3] = wp.length(ray - wp.vec2(car_px, car_py))
                 break
+        observation[i, j + 3] = wp.length(ray - car_pos_px)
 
 
 class Map:
@@ -294,13 +295,33 @@ class Map:
         raw = imread(str(path.parent / self.meta["image"]), IMREAD_GRAYSCALE)
         if raw is None:
             raise FileNotFoundError(path.parent / self.meta["image"])
-        self.occupied = wp.array(raw < OCC_THRESH)
-        self.dt = wp.array(distance_transform_edt(raw >= OCC_THRESH))
+        self.occupied = wp.array(raw < OCC_THRESH, dtype=wp.float32)
+        self.dt = wp.array(distance_transform_edt(raw >= OCC_THRESH), dtype=wp.float32)
         self.ox, self.oy, self.ophi = self.meta["origin"]
         self.h, self.w = self.occupied.shape
         self.res = float(self.meta["resolution"])
         self._compute_centerline(raw)
         self._build_lut()
+
+        try:
+            import rerun as rr
+
+            rr.init("warporacer", spawn=True)
+            rr.log("image/world", rr.Image(raw))
+            rr.log("image/dt", rr.Image(distance_transform_edt(raw >= OCC_THRESH)))
+
+            centerline_px = np.column_stack(
+                [
+                    (self.centerline[:, 0] - self.ox) / self.res,  # col (x in image)
+                    self.h
+                    - 1
+                    - (self.centerline[:, 1] - self.oy) / self.res,  # row (y in image)
+                ]
+            )
+            rr.log("image/world/centerline", rr.Points2D(centerline_px, radii=1.0))
+
+        except ImportError:
+            pass
 
     def _compute_centerline(self, raw, smooth_window=SMOOTH_WINDOW):
         skeleton = skeletonize(raw >= OCC_THRESH)
@@ -356,18 +377,19 @@ class Map:
         self.cum_dist = np.cumsum(np.linalg.norm(self.diffs, axis=1))
 
     def _build_lut(self):
-        centerline_px = np.array(
+        centerline_px = np.column_stack(
             [
-                (self.centerline[:, 0] - self.ox) / self.res,
                 self.h - 1 - (self.centerline[:, 1] - self.oy) / self.res,
+                (self.centerline[:, 0] - self.ox) / self.res,
             ]
-        ).T
+        )
         kdtree = KDTree(centerline_px)
         rows, cols = np.mgrid[: self.h, : self.w]
         self.centerline_lut = wp.array(
-            kdtree.query(np.column_stack([rows.ravel(), cols.ravel()]))[0].reshape(
-                rows.shape
-            )
+            kdtree.query(np.column_stack([rows.ravel(), cols.ravel()]), workers=-1)[
+                1
+            ].reshape(rows.shape),
+            dtype=wp.float32,
         )
 
 
