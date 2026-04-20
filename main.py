@@ -2,16 +2,24 @@
 from collections import deque
 from pathlib import Path
 
+import gymnasium as gym
 import numpy as np
 import torch
+import torch.nn as nn
 import warp as wp
 from cv2 import IMREAD_GRAYSCALE, imread
-from rsl_rl.runners import OnPolicyRunner
 from scipy.ndimage import distance_transform_edt
 from scipy.signal import savgol_filter
 from scipy.spatial import KDTree
 from skimage.morphology import skeletonize
-from tensordict import TensorDict
+from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
+from skrl.envs.wrappers.torch import Wrapper
+from skrl.memories.torch import RandomMemory
+from skrl.models.torch import DeterministicMixin, GaussianMixin, Model
+from skrl.resources.preprocessors.torch import RunningStandardScaler
+from skrl.resources.schedulers.torch import KLAdaptiveLR
+from skrl.trainers.torch import SequentialTrainer
+from skrl.utils import set_seed
 from typer import run
 from yaml import safe_load
 
@@ -402,12 +410,14 @@ class RacingEnv:
     ):
         wp.init()
         self.num_envs = num_envs
-        self.num_obs = OBS_DIM
-        self.num_actions = ACT_DIM
-        self.num_privileged_obs = None
-        self.max_episode_length = MAX_STEPS
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.cfg = {}
+
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32
+        )
+        self.action_space = gym.spaces.Box(
+            low=-1.0, high=1.0, shape=(ACT_DIM,), dtype=np.float32
+        )
 
         self.map = Map(map_path)
         d = self.device
@@ -454,6 +464,10 @@ class RacingEnv:
         self._launch(wp.zeros(num_envs, dtype=wp.vec2, device=d))
         self._sanitize()
 
+    @property
+    def unwrapped(self):
+        return self
+
     def _launch(self, act):
         wp.launch(
             step,
@@ -485,67 +499,95 @@ class RacingEnv:
         if nan_mask.any():
             self._step_counter[nan_mask] = MAX_STEPS
 
-    def _td(self):
-        return TensorDict({"policy": self.obs_buf}, batch_size=[self.num_envs])
-
-    def get_observations(self):
-        return self._td()
-
-    def reset(self):
-        return self._td()
+    def reset(self, seed=None, options=None):
+        return self.obs_buf, {}
 
     def step(self, actions):
         self._launch(wp.from_torch(actions.detach().contiguous(), dtype=wp.vec2))
         self._sanitize()
-        dones = self._step_counter == 0
-        return self._td(), self.rew_buf, dones, {"time_outs": torch.zeros_like(dones)}
+        terminated = (self._step_counter == 0).unsqueeze(-1)
+        truncated = torch.zeros_like(terminated)
+        return (
+            self.obs_buf,
+            self.rew_buf.unsqueeze(-1),
+            terminated,
+            truncated,
+            {},
+        )
+
+    def render(self, *args, **kwargs):
+        return None
+
+    def close(self):
+        pass
 
 
-def build_cfg(iterations: int, seed: int) -> dict:
-    mlp = {
-        "class_name": "MLPModel",
-        "hidden_dims": [256, 128, 64],
-        "activation": "elu",
-        "obs_normalization": True,
-    }
-    return {
-        "seed": seed,
-        "num_steps_per_env": 24,
-        "max_iterations": iterations,
-        "save_interval": 100,
-        "experiment_name": "warporacer",
-        "run_name": "",
-        "logger": "tensorboard",
-        "empirical_normalization": False,
-        "clip_actions": 1.0,
-        "obs_groups": {"policy": ["policy"], "critic": ["policy"]},
-        "actor": {
-            **mlp,
-            "distribution_cfg": {
-                "class_name": "GaussianDistribution",
-                "init_std": 1.0,
-                "std_type": "log",
-            },
-        },
-        "critic": {**mlp, "distribution_cfg": None},
-        "algorithm": {
-            "class_name": "PPO",
-            "num_learning_epochs": 5,
-            "num_mini_batches": 4,
-            "learning_rate": 1e-3,
-            "schedule": "adaptive",
-            "gamma": 0.99,
-            "lam": 0.95,
-            "entropy_coef": 0.005,
-            "desired_kl": 0.01,
-            "max_grad_norm": 1.0,
-            "clip_param": 0.2,
-            "use_clipped_value_loss": True,
-            "value_loss_coef": 1.0,
-            "rnd_cfg": None,
-            "symmetry_cfg": None,
-        },
-    }
+class WarpEnvWrapper(Wrapper):
+    """Thin skrl wrapper around RacingEnv."""
+
+    def __init__(self, env: RacingEnv):
+        super().__init__(env)
+        self._observation_space = env.observation_space
+        self._action_space = env.action_space
+        self._state_space = env.observation_space
+        self._num_envs = env.num_envs
+        self._num_agents = 1
+        self._device = torch.device(env.device)
+
+    def step(self, actions):
+        return self._env.step(actions)
+
+    def reset(self):
+        return self._env.reset()
+
+    def render(self, *args, **kwargs):
+        return self._env.render(*args, **kwargs)
+
+    def close(self):
+        return self._env.close()
+
+
+class Policy(GaussianMixin, Model):
+    def __init__(self, observation_space, action_space, device):
+        Model.__init__(self, observation_space, action_space, device)
+        GaussianMixin.__init__(
+            self,
+            clip_actions=False,
+            clip_log_std=True,
+            min_log_std=-5.0,
+            max_log_std=2.0,
+        )
+        self.net = nn.Sequential(
+            nn.Linear(self.num_observations, 256),
+            nn.ELU(),
+            nn.Linear(256, 128),
+            nn.ELU(),
+            nn.Linear(128, 64),
+            nn.ELU(),
+            nn.Linear(64, self.num_actions),
+        )
+        self.log_std_parameter = nn.Parameter(torch.zeros(self.num_actions))
+
+    def compute(self, inputs, role):
+        return self.net(inputs["states"]), self.log_std_parameter, {}
+
+
+class Value(DeterministicMixin, Model):
+    def __init__(self, observation_space, action_space, device):
+        Model.__init__(self, observation_space, action_space, device)
+        DeterministicMixin.__init__(self, clip_actions=False)
+        self.net = nn.Sequential(
+            nn.Linear(self.num_observations, 256),
+            nn.ELU(),
+            nn.Linear(256, 128),
+            nn.ELU(),
+            nn.Linear(128, 64),
+            nn.ELU(),
+            nn.Linear(64, 1),
+        )
+
+    def compute(self, inputs, role):
+        return self.net(inputs["states"]), {}
 
 
 def main(
@@ -556,10 +598,64 @@ def main(
     log_dir: Path = Path("./logs"),
     device: str = "",
 ):
-    env = RacingEnv(map_yaml, num_envs=num_envs, seed=seed, device=device or None)
-    cfg = build_cfg(iterations, seed)
-    runner = OnPolicyRunner(env, cfg, log_dir=str(log_dir), device=env.device)
-    runner.learn(num_learning_iterations=iterations)
+    set_seed(seed)
+
+    raw_env = RacingEnv(map_yaml, num_envs=num_envs, seed=seed, device=device or None)
+    env = WarpEnvWrapper(raw_env)
+
+    ROLLOUTS = 24
+
+    memory = RandomMemory(
+        memory_size=ROLLOUTS, num_envs=env.num_envs, device=env.device
+    )
+
+    models = {
+        "policy": Policy(env.observation_space, env.action_space, env.device),
+        "value": Value(env.observation_space, env.action_space, env.device),
+    }
+
+    cfg = PPO_DEFAULT_CONFIG.copy()
+    cfg["rollouts"] = ROLLOUTS
+    cfg["learning_epochs"] = 5
+    cfg["mini_batches"] = 4
+    cfg["discount_factor"] = 0.99
+    cfg["lambda"] = 0.95
+    cfg["learning_rate"] = 1e-3
+    cfg["learning_rate_scheduler"] = KLAdaptiveLR
+    cfg["learning_rate_scheduler_kwargs"] = {"kl_threshold": 0.01}
+    cfg["random_timesteps"] = 0
+    cfg["learning_starts"] = 0
+    cfg["grad_norm_clip"] = 1.0
+    cfg["ratio_clip"] = 0.2
+    cfg["value_clip"] = 0.2
+    cfg["clip_predicted_values"] = True
+    cfg["entropy_loss_scale"] = 0.005
+    cfg["value_loss_scale"] = 1.0
+    cfg["kl_threshold"] = 0  # disable hard KL early-stop; scheduler handles LR
+    cfg["state_preprocessor"] = RunningStandardScaler
+    cfg["state_preprocessor_kwargs"] = {
+        "size": env.observation_space,
+        "device": env.device,
+    }
+    cfg["value_preprocessor"] = RunningStandardScaler
+    cfg["value_preprocessor_kwargs"] = {"size": 1, "device": env.device}
+    cfg["experiment"]["directory"] = str(log_dir)
+    cfg["experiment"]["experiment_name"] = "warporacer"
+    cfg["experiment"]["write_interval"] = 100
+    cfg["experiment"]["checkpoint_interval"] = 1000
+
+    agent = PPO(
+        models=models,
+        memory=memory,
+        cfg=cfg,
+        observation_space=env.observation_space,
+        action_space=env.action_space,
+        device=env.device,
+    )
+
+    trainer_cfg = {"timesteps": iterations * ROLLOUTS, "headless": True}
+    trainer = SequentialTrainer(cfg=trainer_cfg, env=env, agents=agent)
+    trainer.train()
 
 
 if __name__ == "__main__":
