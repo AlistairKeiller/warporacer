@@ -159,6 +159,7 @@ def step(
     observation: wp.array2d[float],
     reward: wp.array[float],
     cars: wp.array2d[float],
+    cars_int: wp.array2d[int],
     origin: wp.vec2,
     res: float,
     distance_transform_px: wp.array2d[float],
@@ -176,21 +177,20 @@ def step(
     car_psi = cars[i, 4]
     car_psi_prime = cars[i, 5]
     car_beta = cars[i, 6]
-    car_step = cars[i, 7]
-    car_centerline_pt = wp.int32(cars[i, 8])
+
+    car_steps = cars_int[i, 0]
+    car_waypoint = cars_int[i, 1]
 
     origin_x = origin[0]
     origin_y = origin[1]
 
-    car_px = (car_x - origin_x) / res
-    car_py = float(distance_transform_px.shape[1]) - 1.0 - (car_y - origin_y) / res
+    steer_action = actions[i][0]
+    acceleration_action = actions[i][1]
 
-    car_pos_px = wp.vec2(car_px, car_py)
-
-    steer_v = wp.clamp(actions[i][0], -1.0, 1.0) * STEER_V_MAX
+    steer_v = wp.clamp(steer_action, -1.0, 1.0) * STEER_V_MAX
     if steer_v < 0 and car_delta <= STEER_MIN or steer_v > 0 and car_delta >= STEER_MAX:
         steer_v = 0.0
-    acceleration = wp.clamp(actions[i][1], -1.0, 1.0) * A_MAX
+    acceleration = wp.clamp(acceleration_action, -1.0, 1.0) * A_MAX
     if acceleration < 0 and car_v <= V_MIN or acceleration > 0 and car_v >= V_MAX:
         acceleration = 0.0
 
@@ -226,30 +226,34 @@ def step(
         acceleration,
     )
 
-    cars[i, 0] += (k1.d_x + 2.0 * k2.d_x + 2.0 * k3.d_x + k4.d_x) * DT / 6.0
-    cars[i, 1] += (k1.d_y + 2.0 * k2.d_y + 2.0 * k3.d_y + k4.d_y) * DT / 6.0
-    cars[i, 2] += (
+    car_x += (k1.d_x + 2.0 * k2.d_x + 2.0 * k3.d_x + k4.d_x) * DT / 6.0
+    car_y += (k1.d_y + 2.0 * k2.d_y + 2.0 * k3.d_y + k4.d_y) * DT / 6.0
+    car_delta += (
         (k1.d_delta + 2.0 * k2.d_delta + 2.0 * k3.d_delta + k4.d_delta) * DT / 6.0
     )
-    cars[i, 3] += (k1.d_v + 2.0 * k2.d_v + 2.0 * k3.d_v + k4.d_v) * DT / 6.0
-    cars[i, 4] += (k1.d_psi + 2.0 * k2.d_psi + 2.0 * k3.d_psi + k4.d_psi) * DT / 6.0
-    cars[i, 5] += (k1.dd_psi + 2.0 * k2.dd_psi + 2.0 * k3.dd_psi + k4.dd_psi) * DT / 6.0
-    cars[i, 6] += (k1.d_beta + 2.0 * k2.d_beta + 2.0 * k3.d_beta + k4.d_beta) * DT / 6.0
-    observation[i, 0] = cars[i, 2]
-    observation[i, 1] = cars[i, 3]
-    observation[i, 2] = cars[i, 5]
+    car_v += (k1.d_v + 2.0 * k2.d_v + 2.0 * k3.d_v + k4.d_v) * DT / 6.0
+    car_psi += (k1.d_psi + 2.0 * k2.d_psi + 2.0 * k3.d_psi + k4.d_psi) * DT / 6.0
+    car_psi_prime += (
+        (k1.dd_psi + 2.0 * k2.dd_psi + 2.0 * k3.dd_psi + k4.dd_psi) * DT / 6.0
+    )
+    car_beta += (k1.d_beta + 2.0 * k2.d_beta + 2.0 * k3.d_beta + k4.d_beta) * DT / 6.0
+    car_px = wp.int32((car_x - origin_x) / res)
+    car_py = wp.int32(
+        float(distance_transform_px.shape[1]) - 1.0 - (car_y - origin_y) / res
+    )
+
+    car_pos_px = wp.vec2(wp.float32(car_px), wp.float32(car_py))
 
     # collision logic
-    term = distance_transform_px[wp.int32(car_px), wp.int32(car_py)] * res < wp.length(
+    term = distance_transform_px[car_px, car_py] * res < wp.length(
         wp.vec2(WIDTH / 2.0, LENGTH / 2.0)
     )
-    trunc = car_step >= MAX_STEPS
-    cars[i, 7] += 1.0
+    trunc = car_steps >= MAX_STEPS
+    car_steps += 1
 
     # reward logic
-    new_centerline_pt = centerline_lut[wp.int32(car_px), wp.int32(car_py)]
-    cars[i, 8] = wp.float32(new_centerline_pt)
-    d_centerline_pt = new_centerline_pt - car_centerline_pt
+    new_car_waypoint = centerline_lut[car_px, car_py]
+    d_centerline_pt = new_car_waypoint - car_waypoint
     if d_centerline_pt > num_centerline_pts / 2:
         d_centerline_pt -= num_centerline_pts
     elif d_centerline_pt < -num_centerline_pts / 2:
@@ -263,18 +267,15 @@ def step(
         random_number = (
             wp.int32(wp.uint32(i * 2654435761) >> wp.uint32(16)) % num_centerline_pts
         )
-        cars[i, 0] = centerline[random_number][0]
-        cars[i, 1] = centerline[random_number][1]
-        cars[i, 2] = 0.0
-        cars[i, 3] = 0.0
-        cars[i, 4] = centerline[random_number][2]
-        cars[i, 5] = 0.0
-        cars[i, 6] = 0.0
-        cars[i, 7] = 0.0
-        cars[i, 8] = wp.float32(random_number)
-        car_x = cars[i, 0]
-        car_y = cars[i, 1]
-        car_psi = cars[i, 4]
+        car_x = centerline[random_number][0]
+        car_y = centerline[random_number][1]
+        car_delta = 0.0
+        car_v = 0.0
+        car_psi = centerline[random_number][2]
+        car_psi_prime = 0.0
+        car_beta = 0.0
+        car_steps = 0
+        new_car_waypoint = random_number
 
     # raycast
     sh, ch = wp.sin(car_psi), wp.cos(car_psi)
@@ -283,14 +284,29 @@ def step(
         ca = lidar_dirs[j][0]
         sa = lidar_dirs[j][1]
         d_px = wp.vec2(ch * ca - sh * sa, -(sh * ca + ch * sa))
-        while wp.length(ray - car_pos_px) < LIDAR_RANGE:
+        while wp.length(ray - car_pos_px) * res < LIDAR_RANGE:
             ray_px = wp.int32(ray[0])
             ray_py = wp.int32(ray[1])
             dt_ray = distance_transform_px[ray_px, ray_py]
             ray += d_px * dt_ray
             if dt_ray == 0.0:
                 break
-        observation[i, j + 3] = wp.length(ray - car_pos_px)
+        observation[i, j + 3] = wp.length(ray - car_pos_px) * res
+
+    cars[i, 0] = car_x
+    cars[i, 1] = car_y
+    cars[i, 2] = car_delta
+    cars[i, 3] = car_v
+    cars[i, 4] = car_psi
+    cars[i, 5] = car_psi_prime
+    cars[i, 6] = car_beta
+
+    cars_int[i, 0] = car_steps
+    cars_int[i, 1] = new_car_waypoint
+
+    observation[i, 0] = car_delta
+    observation[i, 1] = car_v
+    observation[i, 2] = car_psi_prime
 
 
 class Map:
@@ -300,10 +316,10 @@ class Map:
         self.raw = imread(str(path.parent / self.meta["image"]), IMREAD_GRAYSCALE)
         if self.raw is None:
             raise FileNotFoundError(path.parent / self.meta["image"])
-        self.occupied = self.raw < OCC_THRESH
+        # self.occupied = self.raw < OCC_THRESH
         self.dt = distance_transform_edt(self.raw >= OCC_THRESH)
         self.ox, self.oy, self.ophi = self.meta["origin"]
-        self.h, self.w = self.occupied.shape
+        # self.h, self.w = self.occupied.shape
         self.res = float(self.meta["resolution"])
         self._compute_centerline(self.raw)
         self._build_lut()
@@ -352,7 +368,7 @@ class Map:
         self.centerline = savgol_filter(world, smooth_window, 3, axis=0, mode="wrap")
         self.diffs = np.diff(self.centerline, axis=0, append=self.centerline[:1])
         self.angles = np.arctan2(self.diffs[:, 1], self.diffs[:, 0])
-        self.cum_dist = np.cumsum(np.linalg.norm(self.diffs, axis=1))
+        # self.cum_dist = np.cumsum(np.linalg.norm(self.diffs, axis=1))
 
     def _build_lut(self):
         centerline_px = np.column_stack(
