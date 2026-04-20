@@ -248,7 +248,7 @@ def step(
 
     # reward logic
     new_centerline_pt = centerline_lut[wp.int32(car_px), wp.int32(car_py)]
-    cars[i, 8] = wp.float(new_centerline_pt)
+    cars[i, 8] = wp.float32(new_centerline_pt)
     d_centerline_pt = new_centerline_pt - car_centerline_pt
     if d_centerline_pt > num_centerline_pts / 2:
         d_centerline_pt -= num_centerline_pts
@@ -272,14 +272,17 @@ def step(
         cars[i, 6] = 0.0
         cars[i, 7] = 0.0
         cars[i, 8] = wp.float32(random_number)
+        car_x = cars[i, 0]
+        car_y = cars[i, 1]
+        car_psi = cars[i, 4]
 
     # raycast
-    ray = wp.vec2(car_px, car_py)
     sh, ch = wp.sin(car_psi), wp.cos(car_psi)
-    for j in range(len(lidar_dirs)):
+    for j in range(lidar_dirs.shape[0]):
+        ray = wp.vec2(car_px, car_py)
         ca = lidar_dirs[j][0]
         sa = lidar_dirs[j][1]
-        d_px = wp.vec2(ch * ca - sh * sa, sh * ca + ch * sa)
+        d_px = wp.vec2(ch * ca - sh * sa, -(sh * ca + ch * sa))
         while wp.length(ray - car_pos_px) < LIDAR_RANGE:
             ray_px = wp.int32(ray[0])
             ray_py = wp.int32(ray[1])
@@ -294,34 +297,16 @@ class Map:
     def __init__(self, path: Path) -> None:
         with open(path, "r") as f:
             self.meta = safe_load(f)
-        raw = imread(str(path.parent / self.meta["image"]), IMREAD_GRAYSCALE)
-        if raw is None:
+        self.raw = imread(str(path.parent / self.meta["image"]), IMREAD_GRAYSCALE)
+        if self.raw is None:
             raise FileNotFoundError(path.parent / self.meta["image"])
-        self.occupied = raw < OCC_THRESH
-        self.dt = distance_transform_edt(raw >= OCC_THRESH)
+        self.occupied = self.raw < OCC_THRESH
+        self.dt = distance_transform_edt(self.raw >= OCC_THRESH)
         self.ox, self.oy, self.ophi = self.meta["origin"]
         self.h, self.w = self.occupied.shape
         self.res = float(self.meta["resolution"])
-        self._compute_centerline(raw)
+        self._compute_centerline(self.raw)
         self._build_lut()
-
-        try:
-            import rerun as rr
-
-            rr.init("warporacer", spawn=True)
-            rr.log("image/world", rr.Image(raw))
-            rr.log("image/dt", rr.Image(distance_transform_edt(raw >= OCC_THRESH)))
-
-            centerline_px = np.column_stack(
-                [
-                    (self.centerline[:, 0] - self.ox) / self.res,
-                    self.h - 1 - (self.centerline[:, 1] - self.oy) / self.res,
-                ]
-            )
-            rr.log("image/world/centerline", rr.Points2D(centerline_px, radii=1.0))
-
-        except ImportError:
-            pass
 
     def _compute_centerline(self, raw, smooth_window=SMOOTH_WINDOW):
         skeleton = skeletonize(raw >= OCC_THRESH)
@@ -389,55 +374,19 @@ def main(yaml_path: Path):
     try:
         import rerun as rr
 
-        n = 1
-        lidar_angles = np.linspace(-np.pi, np.pi, 20)
-        lidar_dirs_np = np.column_stack(
-            [np.cos(lidar_angles), np.sin(lidar_angles)]
-        ).astype(np.float32)
+        rr.init("warporacer")
+        rr.spawn()
 
-        start = map.centerline[0]
-        cars_np = np.zeros((n, 9), dtype=np.float32)
-        cars_np[0, :3] = [start[0], start[1], 0]
-        cars_np[0, 4] = map.angles[0]
-
-        dt_px = wp.array(map.dt.astype(np.float32), dtype=float)
-        lut = wp.array(map.centerline_lut.astype(np.float32), dtype=float)
-        cl = wp.array(
-            np.column_stack([map.centerline, map.angles]).astype(np.float32),
-            dtype=wp.vec3,
+        rr.log("image/raw", rr.Image(map.raw))
+        rr.log("image/world", rr.Image(map.raw))
+        rr.log("image/dt", rr.Image(distance_transform_edt(map.raw >= OCC_THRESH)))
+        centerline_px = np.column_stack(
+            [
+                (map.centerline[:, 0] - map.ox) / map.res,
+                map.h - 1 - (map.centerline[:, 1] - map.oy) / map.res,
+            ]
         )
-        lidar_dirs = wp.array(lidar_dirs_np, dtype=wp.vec2)
-        cars = wp.array(cars_np, dtype=float)
-        actions = wp.zeros((n, 2), dtype=float)
-        obs = wp.zeros((n, 3 + len(lidar_angles)), dtype=float)
-        rew = wp.zeros(n, dtype=float)
-        origin = wp.vec2(float(map.ox), float(map.oy))
-
-        for _ in range(MAX_STEPS):
-            actions_np = np.random.uniform(-1, 1, (n, 2)).astype(np.float32)
-            actions = wp.array(actions_np, dtype=float)
-            wp.launch(
-                step,
-                dim=n,
-                inputs=[
-                    actions,
-                    obs,
-                    rew,
-                    cars,
-                    origin,
-                    map.res,
-                    dt_px,
-                    lut,
-                    cl,
-                    len(map.centerline),
-                    lidar_dirs,
-                ],
-            )
-            c = cars.numpy()
-            rr.log("car/pos", rr.Points2D([[c[0, 0], c[0, 1]]], radii=0.1))
-            rr.log("car/speed", rr.Scalar(c[0, 3]))
-            rr.log("car/reward", rr.Scalar(rew.numpy()[0]))
-
+        rr.log("image/world/centerline", rr.Points2D(centerline_px, radii=1.0))
     except ImportError:
         pass
 
