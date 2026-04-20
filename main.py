@@ -159,8 +159,6 @@ def step(
     actions: wp.array[wp.vec2],
     observation: wp.array2d[float],
     reward: wp.array[float],
-    truncated: wp.array[bool],
-    terminated: wp.array[bool],
     cars: wp.array2d[float],
     origin: wp.vec2,
     res: float,
@@ -259,11 +257,13 @@ def step(
         d_centerline_pt -= num_centerline_pts
     elif d_centerline_pt < -num_centerline_pts / 2:
         d_centerline_pt += num_centerline_pts
-    reward = d_centerline_pt / num_centerline_pts - term
+    reward[i] = d_centerline_pt / num_centerline_pts - term
 
     # reset logic
     if trunc or term:
-        random_number = 0  # TOOD: generate a random number
+        random_number = (
+            wp.int32(wp.uint32(i * 2654435761) >> wp.uint32(16)) % num_centerline_pts
+        )
         cars[i, 0] = centerline[random_number, 0]
         cars[i, 1] = centerline[random_number, 1]
         cars[i, 2] = 0.0
