@@ -83,8 +83,6 @@ DONE_TRUNCATED = 2
 class VehicleD:
     d_x: float
     d_y: float
-    d_delta: float
-    d_v: float
     d_psi: float
     d_beta: float
     dd_psi: float
@@ -105,27 +103,29 @@ def vehicle_dynamics_st(
     lr_s: float,
 ):
     state = VehicleD()
-    state.d_delta = steer_v
-    state.d_v = acceleration
 
     lf = LENGTH_FRONT * lf_s
     lr = LENGTH_REAR * lr_s
     lwb = lf + lr
+    inv_lwb = 1.0 / lwb
     mass = MASS * mass_s
     mu = MU * mu_s
 
     tand = wp.tan(car_delta)
     cosd = wp.cos(car_delta)
     cosd2 = cosd * cosd
-    tl_ratio = tand * lr / lwb
-    beta_k = wp.atan(tl_ratio)
-    cbk = wp.cos(beta_k)
-    sbk = wp.sin(beta_k)
-    d_x_k = car_v * wp.cos(beta_k + car_psi)
-    d_y_k = car_v * wp.sin(beta_k + car_psi)
-    d_psi_k = car_v * cbk * tand / lwb
-    d_beta_k = (lr * steer_v) / (lwb * cosd2 * (1.0 + tl_ratio * tl_ratio))
-    dd_psi_k = (1.0 / lwb) * (
+    tl_ratio = tand * lr * inv_lwb
+    inv_sq = 1.0 / wp.sqrt(1.0 + tl_ratio * tl_ratio)
+    cbk = inv_sq
+    sbk = tl_ratio * inv_sq
+
+    cp = wp.cos(car_psi)
+    sp = wp.sin(car_psi)
+    d_x_k = car_v * (cbk * cp - sbk * sp)
+    d_y_k = car_v * (sbk * cp + cbk * sp)
+    d_psi_k = car_v * cbk * tand * inv_lwb
+    d_beta_k = lr * steer_v * inv_lwb / cosd2 * inv_sq * inv_sq
+    dd_psi_k = inv_lwb * (
         acceleration * cbk * tand
         - car_v * sbk * d_beta_k * tand
         + car_v * cbk * steer_v / cosd2
@@ -133,29 +133,34 @@ def vehicle_dynamics_st(
 
     w_dyn = 0.5 * (wp.tanh((car_v - V_SWITCH) / V_BLEND_WIDTH) + 1.0)
     v_safe = wp.max(car_v, V_BLEND_MIN)
+    inv_v_safe = 1.0 / v_safe
 
     g_lr_a = G * lr - acceleration * CG_HEIGHT
     g_lf_a = G * lf + acceleration * CG_HEIGHT
     cf = FRONT_CORNERING_STIFFNESS
     cr = REAR_CORNERING_STIFFNESS
+    cf_glra = cf * g_lr_a
+    cr_glfa = cr * g_lf_a
+    lf_cf_glra = lf * cf_glra
+    lr_cr_glfa = lr * cr_glfa
+
+    mm_il = mu * mass * inv_lwb / INERTIA
+    m_vl = mu * inv_lwb * inv_v_safe
 
     dd_psi_d = (
-        -mu
-        * mass
-        / (v_safe * INERTIA * lwb)
-        * (lf * lf * cf * g_lr_a + lr * lr * cr * g_lf_a)
-        * car_psi_prime
-        + mu * mass / (INERTIA * lwb) * (lr * cr * g_lf_a - lf * cf * g_lr_a) * car_beta
-        + mu * mass / (INERTIA * lwb) * lf * cf * g_lr_a * car_delta
+        -mm_il * inv_v_safe * (lf * lf_cf_glra + lr * lr_cr_glfa) * car_psi_prime
+        + mm_il * (lr_cr_glfa - lf_cf_glra) * car_beta
+        + mm_il * lf_cf_glra * car_delta
     )
     d_beta_d = (
-        (mu / (v_safe * v_safe * lwb) * (cr * g_lf_a * lr - cf * g_lr_a * lf) - 1.0)
-        * car_psi_prime
-        - mu / (v_safe * lwb) * (cr * g_lf_a + cf * g_lr_a) * car_beta
-        + mu / (v_safe * lwb) * cf * g_lr_a * car_delta
+        (m_vl * inv_v_safe * (lr_cr_glfa - lf_cf_glra) - 1.0) * car_psi_prime
+        - m_vl * (cr_glfa + cf_glra) * car_beta
+        + m_vl * cf_glra * car_delta
     )
-    d_x_d = car_v * wp.cos(car_beta + car_psi)
-    d_y_d = car_v * wp.sin(car_beta + car_psi)
+    cb = wp.cos(car_beta)
+    sb = wp.sin(car_beta)
+    d_x_d = car_v * (cb * cp - sb * sp)
+    d_y_d = car_v * (sb * cp + cb * sp)
     d_psi_d = car_psi_prime
 
     w_kin = 1.0 - w_dyn
@@ -181,6 +186,11 @@ def rk4_step(
     lf_s: float,
     lr_s: float,
 ):
+    dd_half = steer_v * DT_SUB_HALF
+    dv_half = acceleration * DT_SUB_HALF
+    dd_full = steer_v * DT_SUB
+    dv_full = acceleration * DT_SUB
+
     k1 = vehicle_dynamics_st(
         car_delta,
         car_v,
@@ -195,8 +205,8 @@ def rk4_step(
         lr_s,
     )
     k2 = vehicle_dynamics_st(
-        car_delta + k1.d_delta * DT_SUB_HALF,
-        car_v + k1.d_v * DT_SUB_HALF,
+        car_delta + dd_half,
+        car_v + dv_half,
         car_psi + k1.d_psi * DT_SUB_HALF,
         car_psi_prime + k1.dd_psi * DT_SUB_HALF,
         car_beta + k1.d_beta * DT_SUB_HALF,
@@ -208,8 +218,8 @@ def rk4_step(
         lr_s,
     )
     k3 = vehicle_dynamics_st(
-        car_delta + k2.d_delta * DT_SUB_HALF,
-        car_v + k2.d_v * DT_SUB_HALF,
+        car_delta + dd_half,
+        car_v + dv_half,
         car_psi + k2.d_psi * DT_SUB_HALF,
         car_psi_prime + k2.dd_psi * DT_SUB_HALF,
         car_beta + k2.d_beta * DT_SUB_HALF,
@@ -221,8 +231,8 @@ def rk4_step(
         lr_s,
     )
     k4 = vehicle_dynamics_st(
-        car_delta + k3.d_delta * DT_SUB,
-        car_v + k3.d_v * DT_SUB,
+        car_delta + dd_full,
+        car_v + dv_full,
         car_psi + k3.d_psi * DT_SUB,
         car_psi_prime + k3.dd_psi * DT_SUB,
         car_beta + k3.d_beta * DT_SUB,
@@ -236,10 +246,6 @@ def rk4_step(
     out = VehicleD()
     out.d_x = (k1.d_x + 2.0 * k2.d_x + 2.0 * k3.d_x + k4.d_x) * DT_SUB_SIX
     out.d_y = (k1.d_y + 2.0 * k2.d_y + 2.0 * k3.d_y + k4.d_y) * DT_SUB_SIX
-    out.d_delta = (
-        k1.d_delta + 2.0 * k2.d_delta + 2.0 * k3.d_delta + k4.d_delta
-    ) * DT_SUB_SIX
-    out.d_v = (k1.d_v + 2.0 * k2.d_v + 2.0 * k3.d_v + k4.d_v) * DT_SUB_SIX
     out.d_psi = (k1.d_psi + 2.0 * k2.d_psi + 2.0 * k3.d_psi + k4.d_psi) * DT_SUB_SIX
     out.dd_psi = (
         k1.dd_psi + 2.0 * k2.dd_psi + 2.0 * k3.dd_psi + k4.dd_psi
@@ -268,6 +274,7 @@ def step_kernel(
     look_step: int,
     lidar_dirs: wp.array[wp.vec2],
     seed_base: int,
+    write_centerline: int,
 ):
     i = wp.tid()
 
@@ -290,6 +297,7 @@ def step_kernel(
     origin_y = origin[1]
     map_w = distance_transform_px.shape[0]
     map_h = distance_transform_px.shape[1]
+    map_h_f = wp.float32(map_h) - 1.0
 
     steer_v = wp.clamp(actions[i][0], -1.0, 1.0) * STEER_V_MAX
     if (steer_v < 0.0 and car_delta <= STEER_MIN) or (
@@ -301,6 +309,9 @@ def step_kernel(
         acceleration > 0.0 and car_v >= V_MAX
     ):
         acceleration = 0.0
+
+    dd_sub = steer_v * DT_SUB
+    dv_sub = acceleration * DT_SUB
 
     for _ in range(SUBSTEPS):
         d = rk4_step(
@@ -318,8 +329,8 @@ def step_kernel(
         )
         car_x += d.d_x
         car_y += d.d_y
-        car_delta += d.d_delta
-        car_v += d.d_v
+        car_delta += dd_sub
+        car_v += dv_sub
         car_psi += d.d_psi
         car_psi_prime += d.dd_psi
         car_beta += d.d_beta
@@ -330,9 +341,7 @@ def step_kernel(
     car_beta = wp.clamp(car_beta, -1.2, 1.2)
 
     car_px = wp.clamp(wp.int32((car_x - origin_x) / res), 0, map_w - 1)
-    car_py = wp.clamp(
-        wp.int32(wp.float32(map_h) - 1.0 - (car_y - origin_y) / res), 0, map_h - 1
-    )
+    car_py = wp.clamp(wp.int32(map_h_f - (car_y - origin_y) / res), 0, map_h - 1)
 
     edt_val = distance_transform_px[car_px, car_py] * res
     term = edt_val < CAR_HALF_DIAG
@@ -353,10 +362,9 @@ def step_kernel(
         * (1.0 + wp.max(car_v, 0.0) / PROGRESS_V_COEF)
     )
     wall = -WALL_PENALTY_COEF * wp.exp(-WALL_PENALTY_RATE * edt_val)
-    slip = -SLIP_PENALTY_COEF * car_beta * car_beta
-    term_pen = float(0.0)
-    if term:
-        term_pen = -TERM_PENALTY
+    beta_kin = wp.atan(wp.tan(car_delta) * LENGTH_REAR / LENGTH_WHEELBASE)
+    slip = -SLIP_PENALTY_COEF * (car_beta - beta_kin) * (car_beta - beta_kin)
+    term_pen = wp.where(term, -TERM_PENALTY, 0.0)
     reward[i] = progress + wall + slip + term_pen
 
     if term:
@@ -372,11 +380,12 @@ def step_kernel(
             wp.int32(wp.randf(rng) * wp.float32(num_centerline_pts))
             % num_centerline_pts
         )
-        car_x = centerline[random_number][0]
-        car_y = centerline[random_number][1]
+        rpt = centerline[random_number]
+        car_x = rpt[0]
+        car_y = rpt[1]
         car_delta = 0.0
         car_v = 0.0
-        car_psi = centerline[random_number][2]
+        car_psi = rpt[2]
         car_psi_prime = 0.0
         car_beta = 0.0
         car_steps = 0
@@ -393,11 +402,12 @@ def step_kernel(
     lidar_y = car_y + LENGTH_FRONT * sh
     lidar_px = wp.clamp(wp.int32((lidar_x - origin_x) / res), 0, map_w - 1)
     lidar_py = wp.clamp(
-        wp.int32(wp.float32(map_h) - 1.0 - (lidar_y - origin_y) / res),
+        wp.int32(map_h_f - (lidar_y - origin_y) / res),
         0,
         map_h - 1,
     )
     lidar_pos_px = wp.vec2(wp.float32(lidar_px), wp.float32(lidar_py))
+    lidar_range_px = LIDAR_RANGE / res
 
     for j in range(lidar_dirs.shape[0]):
         ray = lidar_pos_px
@@ -405,7 +415,7 @@ def step_kernel(
         ca = lidar_dirs[j][0]
         sa = lidar_dirs[j][1]
         d_px = wp.vec2(ch * ca - sh * sa, -(sh * ca + ch * sa))
-        while dist_px * res < LIDAR_RANGE:
+        while dist_px < lidar_range_px:
             ray_px = wp.int32(ray[0])
             ray_py = wp.int32(ray[1])
             if ray_px < 0 or ray_px >= map_w or ray_py < 0 or ray_py >= map_h:
@@ -415,29 +425,34 @@ def step_kernel(
             dist_px += dt_ray
             if dt_ray == 0.0:
                 break
-        observation[i, j + 3] = wp.min(dist_px * res, LIDAR_RANGE)
+        observation[i, j + 3] = wp.min(dist_px, lidar_range_px) * res
 
-    cx_pt = centerline[new_car_waypoint][0]
-    cy_pt = centerline[new_car_waypoint][1]
-    cth_pt = centerline[new_car_waypoint][2]
+    if write_centerline != 0:
+        cpt = centerline[new_car_waypoint]
+        cx_pt = cpt[0]
+        cy_pt = cpt[1]
+        cth_pt = cpt[2]
 
-    heading_err_raw = cth_pt - car_psi
-    heading_err = wp.atan2(wp.sin(heading_err_raw), wp.cos(heading_err_raw))
-    dx_c = car_x - cx_pt
-    dy_c = car_y - cy_pt
-    lateral_err = -dx_c * wp.sin(cth_pt) + dy_c * wp.cos(cth_pt)
+        s_cth = wp.sin(cth_pt)
+        c_cth = wp.cos(cth_pt)
+        heading_err = wp.atan2(s_cth * ch - c_cth * sh, c_cth * ch + s_cth * sh)
+        dx_c = car_x - cx_pt
+        dy_c = car_y - cy_pt
+        lateral_err = -dx_c * s_cth + dy_c * c_cth
 
-    observation[i, OBS_FRENET_OFF] = heading_err
-    observation[i, OBS_FRENET_OFF + 1] = lateral_err
+        observation[i, OBS_FRENET_OFF] = heading_err
+        observation[i, OBS_FRENET_OFF + 1] = lateral_err
 
-    for k in range(NUM_LOOKAHEAD):
-        idx = (new_car_waypoint + (k + 1) * look_step) % num_centerline_pts
-        wx = centerline[idx][0]
-        wy = centerline[idx][1]
-        dx = wx - car_x
-        dy = wy - car_y
-        observation[i, OBS_LOOK_OFF + k * 2] = dx * ch + dy * sh
-        observation[i, OBS_LOOK_OFF + k * 2 + 1] = -dx * sh + dy * ch
+        idx = new_car_waypoint
+        for k in range(NUM_LOOKAHEAD):
+            idx += look_step
+            if idx >= num_centerline_pts:
+                idx -= num_centerline_pts
+            wpt = centerline[idx]
+            dx = wpt[0] - car_x
+            dy = wpt[1] - car_y
+            observation[i, OBS_LOOK_OFF + k * 2] = dx * ch + dy * sh
+            observation[i, OBS_LOOK_OFF + k * 2 + 1] = -dx * sh + dy * ch
 
     cars[i, 0] = car_x
     cars[i, 1] = car_y
@@ -461,30 +476,29 @@ class Map:
         self.raw = imread(str(img_path), IMREAD_GRAYSCALE)
         if self.raw is None:
             raise FileNotFoundError(img_path)
-        self.dt = distance_transform_edt(self.raw >= OCC_THRESH)
-        self.ox, self.oy, self.ophi = self.meta["origin"]
+        free = self.raw >= OCC_THRESH
+        self.dt = distance_transform_edt(free)
+        self.ox, self.oy, _ = self.meta["origin"]
         self.h, self.w = self.raw.shape
         self.res = float(self.meta["resolution"])
-        self._compute_centerline()
+        self._compute_centerline(free)
         self._build_lut()
 
     @staticmethod
-    def _neighbors(skeleton, r, c):
-        h, w = skeleton.shape
+    def _neighbors(skeleton, r, c, h, w):
         return [
             (r + dr, c + dc)
             for dr, dc in ADJ
             if 0 <= r + dr < h and 0 <= c + dc < w and skeleton[r + dr, c + dc]
         ]
 
-    def _compute_centerline(self, smooth_window=SMOOTH_WINDOW):
-        skeleton = skeletonize(self.raw >= OCC_THRESH)
+    def _compute_centerline(self, free, smooth_window=SMOOTH_WINDOW):
+        skeleton = skeletonize(free)
+        h, w = skeleton.shape
         pts = np.argwhere(skeleton)
         origin_px = np.array([self.h - 1 + self.oy / self.res, -self.ox / self.res])
-        start = tuple(
-            int(x) for x in pts[np.argmin(np.linalg.norm(pts - origin_px, axis=1))]
-        )
-        nbrs = self._neighbors(skeleton, *start)
+        start = tuple(int(x) for x in pts[np.argmin(((pts - origin_px) ** 2).sum(1))])
+        nbrs = self._neighbors(skeleton, start[0], start[1], h, w)
         if len(nbrs) < 2:
             raise RuntimeError(
                 f"Skeleton seed {start} has {len(nbrs)} neighbors; need a closed loop."
@@ -495,7 +509,7 @@ class Map:
         q = deque([src])
         while q:
             r, c = q.popleft()
-            for nr, nc in self._neighbors(skeleton, r, c):
+            for nr, nc in self._neighbors(skeleton, r, c, h, w):
                 n = (nr, nc)
                 if n in parent or n == start:
                     continue
@@ -553,6 +567,7 @@ class RacingEnv:
         self.num_envs = num_envs
         self.use_centerline_obs = use_centerline_obs
         self.obs_dim = OBS_DIM if use_centerline_obs else OBS_FRENET_OFF
+        self._write_centerline = 1 if use_centerline_obs else 0
         self.observation_space = gym.spaces.Box(
             -np.inf, np.inf, (self.obs_dim,), dtype=np.float32
         )
@@ -583,7 +598,7 @@ class RacingEnv:
         cars_int[:, 1] = idxs
 
         dr_init = (
-            1.0 - DR_FRAC + 2.0 * DR_FRAC * rng.random((num_envs, 4)).astype(np.float32)
+            1.0 - DR_FRAC + 2.0 * DR_FRAC * rng.random((num_envs, 4), dtype=np.float32)
         )
 
         self.cars = wp.array(cars, dtype=float, device=d)
@@ -592,6 +607,7 @@ class RacingEnv:
         self.obs = wp.zeros((num_envs, OBS_DIM), dtype=float, device=d)
         self.rew = wp.zeros(num_envs, dtype=float, device=d)
         self.done = wp.zeros(num_envs, dtype=int, device=d)
+        self._wp_device = self.cars.device
 
         self.obs_buf = wp.to_torch(self.obs)
         self._obs_view = self.obs_buf[:, : self.obs_dim]
@@ -640,23 +656,24 @@ class RacingEnv:
                 self.look_step,
                 self.lidar_buf,
                 int(seed),
+                self._write_centerline,
             ],
         )
-        wp.synchronize_device(self.cars.device)
+        wp.synchronize_device(self._wp_device)
         self._call_count += 1
 
     def _sanitize(self):
         bad = ~(
             torch.isfinite(self.obs_buf).all(1) & torch.isfinite(self.cars_buf).all(1)
         )
+        if not bad.any().item():
+            return
         torch.nan_to_num_(self.obs_buf, nan=0.0, posinf=LIDAR_RANGE, neginf=0.0)
         torch.nan_to_num_(self.cars_buf, nan=0.0, posinf=0.0, neginf=0.0)
         torch.nan_to_num_(self.rew_buf, nan=0.0, posinf=0.0, neginf=0.0)
-        n_bad = int(bad.sum().item())
-        if n_bad:
-            self.nan_events += n_bad
-            self._step_counter[bad] = MAX_STEPS
-            self.done_buf[bad] = DONE_TRUNCATED
+        self.nan_events += int(bad.sum().item())
+        self._step_counter[bad] = MAX_STEPS
+        self.done_buf[bad] = DONE_TRUNCATED
 
     def reset(self):
         self._step_counter.fill_(MAX_STEPS)
@@ -702,12 +719,11 @@ class RunningMeanStd:
 
     def update(self, x: torch.Tensor) -> None:
         x = x.reshape(-1, *self.mean.shape).float()
-        bm = x.mean(0)
-        bv = x.var(0, unbiased=False)
+        bv, bm = torch.var_mean(x, dim=0, unbiased=False)
         bc = x.shape[0]
         delta = bm - self.mean
         tot = self.count + bc
-        self.mean = self.mean + delta * (bc / tot)
+        self.mean.add_(delta, alpha=bc / tot)
         m2 = self.var * self.count + bv * bc + delta * delta * (self.count * bc / tot)
         self.var = m2 / tot
         self.count = tot
@@ -724,7 +740,7 @@ class ReturnNormalizer:
         self.rms = RunningMeanStd((), device)
 
     def update(self, reward, done):
-        self.returns = self.returns * self.gamma * (1.0 - done.float()) + reward.float()
+        self.returns = self.returns * self.gamma * (1.0 - done) + reward
         self.rms.update(self.returns)
 
     def normalize(self, reward):
@@ -768,12 +784,12 @@ class Agent(nn.Module):
         log_std = self.actor_logstd.expand_as(mean).clamp(-5.0, 0.5)
         return Normal(mean, log_std.exp())
 
-    def act_value(self, obs, action=None):
+    def act_value(self, obs, action=None, need_entropy: bool = True):
         dist = self._dist(obs)
         if action is None:
             action = dist.sample()
         log_prob = dist.log_prob(action).sum(-1)
-        entropy = dist.entropy().sum(-1)
+        entropy = dist.entropy().sum(-1) if need_entropy else None
         value = self.value(obs)
         return action, log_prob, entropy, value
 
@@ -843,14 +859,16 @@ def record_rollout(
         ) as writer:
             with torch.no_grad():
                 for _ in range(num_steps):
-                    if deterministic:
-                        action = agent.deterministic(obs)
-                    else:
-                        action, *_ = agent.act_value(obs)
+                    action = (
+                        agent.deterministic(obs)
+                        if deterministic
+                        else agent.act_value(obs, need_entropy=False)[0]
+                    )
                     raw_obs, _, term, trunc, _ = env.step(action)
                     obs = obs_rms.normalize(raw_obs) if obs_rms is not None else raw_obs
 
-                    x, y, psi = (float(v) for v in env.cars_buf[0, [0, 1, 4]])
+                    row = env.cars_buf[0].tolist()
+                    x, y, psi = row[0], row[1], row[4]
                     if bool(term[0].item()) or bool(trunc[0].item()):
                         trail.clear()
                     trail.append((x, y))
@@ -945,47 +963,46 @@ def train(
 
     for it in range(iterations):
         agent.eval()
-        for t in range(rollouts):
-            obs_buf[t] = obs
-            with torch.no_grad():
-                action, log_prob, _, value = agent.act_value(obs)
-            act_buf[t] = action
-            logp_buf[t] = log_prob
-            val_buf[t] = value
-
-            raw_obs, raw_reward, term, trunc, _ = env.step(action)
-            done = (term | trunc).float()
-
-            ret_rms.update(raw_reward, done)
-            rew_buf[t] = ret_rms.normalize(raw_reward)
-            done_buf[t] = done
-            term_buf[t] = term.float()
-
-            ep_returns = ep_returns + raw_reward
-            ep_steps = ep_steps + 1
-            ep_ret_buf[t] = ep_returns
-            ep_len_buf[t] = ep_steps
-            nonterm = 1.0 - done
-            ep_returns = ep_returns * nonterm
-            ep_steps = ep_steps * nonterm
-
-            obs_rms.update(raw_obs)
-            obs = obs_rms.normalize(raw_obs)
-
-        global_step += rollouts * num_envs
-
         with torch.no_grad():
+            for t in range(rollouts):
+                obs_buf[t] = obs
+                action, log_prob, _, value = agent.act_value(obs, need_entropy=False)
+                act_buf[t] = action
+                logp_buf[t] = log_prob
+                val_buf[t] = value
+
+                raw_obs, raw_reward, term, trunc, _ = env.step(action)
+                done = (term | trunc).float()
+
+                ret_rms.update(raw_reward, done)
+                rew_buf[t] = ret_rms.normalize(raw_reward)
+                done_buf[t] = done
+                term_buf[t] = term.float()
+
+                ep_returns.add_(raw_reward)
+                ep_steps.add_(1.0)
+                ep_ret_buf[t] = ep_returns
+                ep_len_buf[t] = ep_steps
+                nonterm = 1.0 - done
+                ep_returns.mul_(nonterm)
+                ep_steps.mul_(nonterm)
+
+                obs_rms.update(raw_obs)
+                obs = obs_rms.normalize(raw_obs)
+
             next_value = agent.value(obs)
+            val_ext = torch.cat([val_buf, next_value.unsqueeze(0)], 0)
             adv_buf = torch.zeros_like(rew_buf)
             last_gae = torch.zeros_like(next_value)
             for t in reversed(range(rollouts)):
-                next_v = val_buf[t + 1] if t < rollouts - 1 else next_value
                 nonterm = 1.0 - term_buf[t]
                 nondone = 1.0 - done_buf[t]
-                delta = rew_buf[t] + gamma * next_v * nonterm - val_buf[t]
+                delta = rew_buf[t] + gamma * val_ext[t + 1] * nonterm - val_buf[t]
                 last_gae = delta + gamma * gae_lambda * nondone * last_gae
                 adv_buf[t] = last_gae
             ret_buf = adv_buf + val_buf
+
+        global_step += rollouts * num_envs
 
         finished = done_buf.bool()
         if finished.any():
@@ -1031,24 +1048,25 @@ def train(
                 mb_adv = b_adv[mb]
                 mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
-                pg_loss = torch.max(
-                    -mb_adv * ratio,
-                    -mb_adv * ratio.clamp(1.0 - clip_coef, 1.0 + clip_coef),
-                ).mean()
+                surr1 = ratio * mb_adv
+                surr2 = ratio.clamp(1.0 - clip_coef, 1.0 + clip_coef) * mb_adv
+                pg_loss = -torch.min(surr1, surr2).mean()
 
+                mb_val = b_val[mb]
+                mb_ret = b_ret[mb]
+                v_err = new_val - mb_ret
                 if vf_clip_coef > 0:
-                    v_clipped = b_val[mb] + (new_val - b_val[mb]).clamp(
+                    v_clipped = mb_val + (new_val - mb_val).clamp(
                         -vf_clip_coef, vf_clip_coef
                     )
                     v_loss = (
                         0.5
                         * torch.max(
-                            (new_val - b_ret[mb]).pow(2),
-                            (v_clipped - b_ret[mb]).pow(2),
+                            v_err.square(), (v_clipped - mb_ret).square()
                         ).mean()
                     )
                 else:
-                    v_loss = 0.5 * (new_val - b_ret[mb]).pow(2).mean()
+                    v_loss = 0.5 * v_err.square().mean()
 
                 ent = entropy.mean()
                 loss = pg_loss + vf_coef * v_loss - ent_coef * ent
@@ -1144,7 +1162,7 @@ def main(
     )
     agent = Agent(obs_dim=env.obs_dim).to(env.device)
 
-    if use_wandb and wandb is not None:
+    if use_wandb:
         try:
             wandb.init(
                 project="warporacer",
