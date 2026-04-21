@@ -1,11 +1,3 @@
-"""F1TENTH racing env + PPO on Warp.
-
-Single-track vehicle model with smooth tanh blend between the kinematic
-(low-v, geometric bicycle) and dynamic (high-v, linear cornering stiffness)
-regimes -- no hard regime switch for the policy to exploit. Domain
-randomization on (mu, mass, lf, lr) per episode.
-"""
-
 import time
 from collections import deque
 from pathlib import Path
@@ -34,12 +26,9 @@ from yaml import safe_load
 
 import wandb
 
-# ============================================================================
-# Vehicle & simulation constants
-# ============================================================================
 MU = 1.0489
-C_SF = 4.718  # front cornering stiffness coefficient (CommonRoad)
-C_SR = 5.4562  # rear
+C_SF = 4.718  # front cornering stiffness coefficient
+C_SR = 5.4562  # rear cornering stiffness coefficient
 LF = 0.15875
 LR = 0.17145
 LWB = LF + LR
@@ -50,16 +39,16 @@ I_Z = 0.04712
 STEER_MIN = -0.4189
 STEER_MAX = 0.4189
 STEER_V_MAX = 3.2
-V_SWITCH = 7.319
-V_BLEND_WIDTH = 0.5  # tanh transition width (m/s)
-V_BLEND_MIN = 1.0  # floor on v in dynamic-model 1/v terms
+V_SWITCH = 2.0
+V_BLEND_WIDTH = 1.0
+V_BLEND_MIN = 1.0
 A_MAX = 9.51
 V_MIN = -5.0
 V_MAX = 20.0
 PSI_PRIME_MAX = 6.0
 BETA_MAX = 1.2
 
-WIDTH = 0.31
+# Car constants
 LENGTH = 0.58
 CAR_HALF_DIAG = float(np.hypot(WIDTH / 2.0, LENGTH / 2.0))
 G = 9.81
@@ -69,10 +58,8 @@ DT_SUB = DT / float(SUBSTEPS)
 DT_SUB_HALF = DT_SUB * 0.5
 DT_SUB_SIX = DT_SUB / 6.0
 
-# Domain randomization
 DR_FRAC = 0.15  # +/- 15% on (mu, mass, lf, lr) per episode
 
-# Reward
 PROGRESS_SCALE = 100.0
 PROGRESS_V_COEF = 10.0
 WALL_PENALTY_COEF = 0.1
@@ -82,7 +69,6 @@ SLIP_THRESHOLD = 0.08
 STEER_PENALTY_COEF = 0.02
 TERM_PENALTY = 100.0
 
-# Observation layout
 NUM_LIDAR = 108
 LIDAR_FOV = np.radians(270.0)
 LIDAR_RANGE = 20.0
@@ -100,9 +86,6 @@ DONE_TERMINATED = 1
 DONE_TRUNCATED = 2
 
 
-# ============================================================================
-# Vehicle dynamics: tanh-blended kinematic/dynamic single-track
-# ============================================================================
 @wp.struct
 class VDeriv:
     d_x: float
@@ -155,25 +138,25 @@ def st_deriv(
     # --- Dynamic (high-speed, linear cornering stiffness) ---
     v_safe = wp.max(v, V_BLEND_MIN)
     inv_v = 1.0 / v_safe
-    g_lr_a = G * lr - accel * H_CG
-    g_lf_a = G * lf + accel * H_CG
-    cf_a = C_SF * g_lr_a
-    cr_a = C_SR * g_lf_a
-    lf_cf = lf * cf_a
-    lr_cr = lr * cr_a
-    mm_il = mu * mass * inv_lwb / I_Z
-    m_vl = mu * inv_lwb * inv_v
 
-    dpsip_d = (
-        -mm_il * inv_v * (lf * lf_cf + lr * lr_cr) * psip
-        + mm_il * (lr_cr - lf_cf) * beta
-        + mm_il * lf_cf * delta
-    )
-    dbeta_d = (
-        (m_vl * inv_v * (lr_cr - lf_cf) - 1.0) * psip
-        - m_vl * (cr_a + cf_a) * beta
-        + m_vl * cf_a * delta
-    )
+    # Linear slip angles (same approximation as before). Saturation in the
+    # force law handles the large-slip regime.
+    alpha_f = beta + lf * psip * inv_v - delta
+    alpha_r = beta - lr * psip * inv_v
+
+    # Vertical loads with longitudinal load transfer.
+    fzf = mass * (G * lr - accel * H_CG) * inv_lwb
+    fzr = mass * (G * lf + accel * H_CG) * inv_lwb
+    fmax_f = mu * fzf
+    fmax_r = mu * fzr
+
+    # Saturating lateral tire force:  small alpha -> F_y ~ -C_S * mu * F_z * alpha
+    #                                  large alpha -> F_y -> sign(-alpha) * mu * F_z
+    f_yf = -fmax_f * wp.tanh(C_SF * alpha_f)
+    f_yr = -fmax_r * wp.tanh(C_SR * alpha_r)
+
+    dpsip_d = (lf * f_yf - lr * f_yr) / I_Z
+    dbeta_d = (f_yf + f_yr) / (mass * v_safe) - psip
     cb = wp.cos(beta)
     sb = wp.sin(beta)
     dx_d = v * (cb * cp - sb * sp)
@@ -264,9 +247,6 @@ def rk4_step(
     return out
 
 
-# ============================================================================
-# Step kernel
-# ============================================================================
 @wp.kernel
 def step_kernel(
     actions: wp.array(dtype=wp.vec2),
