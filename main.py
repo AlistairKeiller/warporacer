@@ -141,11 +141,10 @@ ACT_DIM = 2
 
 # simulation parameters
 MAX_STEPS = 10_000
-PROGRESS_SCALE = 100.0
-PROGRESS_V_COEF = 10.0
-WALL_PENALTY_COEF = 0.1
+PROGRESS_SCALE = 10.0
+WALL_PENALTY_COEF = 0.05
 WALL_PENALTY_RATE = 3.0
-TERM_PENALTY = 100.0
+TERM_PENALTY = 20.0
 
 # occupancy grid parameters
 OCC_THRESH = 230
@@ -169,7 +168,7 @@ def reset29(sx: float, sy: float, psi: float) -> vec29:
         sx,
         sy,
         0.0,
-        0.0,
+        3.0,
         psi,
         0.0,
         0.0,
@@ -189,10 +188,10 @@ def reset29(sx: float, sy: float, psi: float) -> vec29:
         0.0,
         ZUR_STATIC,
         0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
+        59.4,
+        59.4,
+        59.4,
+        59.4,
         0.0,
         0.0,
     )
@@ -605,12 +604,7 @@ def step_kernel(
     vy_w = s[3] * sh + s[10] * ch
     v_along = vx_w * wp.cos(cth) + vy_w * wp.sin(cth)
 
-    progress = (
-        wp.float32(d_wp)
-        / wp.float32(n_cl)
-        * PROGRESS_SCALE
-        * (1.0 + wp.max(v_along, 0.0) / PROGRESS_V_COEF)
-    )
+    progress = wp.max(v_along, -2.0) * PROGRESS_SCALE * DT
     wall = -WALL_PENALTY_COEF * wp.exp(-WALL_PENALTY_RATE * edt_val)
     term_pen = wp.where(term, -TERM_PENALTY, 0.0)
     reward[i] = progress + wall + term_pen
@@ -975,7 +969,7 @@ def _draw_frame(m, sx, sy, psi):
     pts = m.centerline[:, :2]
     ui = ((pts[:, 0] - m.origin[0]) / m.resolution).astype(np.int32)
     vi = (h - 1 - (pts[:, 1] - m.origin[1]) / m.resolution).astype(np.int32)
-    polylines(img, [np.stack([ui, vi], axis=1)], True, (0, 180, 0), 1)
+    polylines(img, [np.stack([ui, vi], axis=1)], False, (0, 180, 0), 1)
     c, s = np.cos(psi), np.sin(psi)
     corners = np.array(
         [
