@@ -139,25 +139,25 @@ def st_deriv(
     # --- Dynamic (high-speed, linear cornering stiffness) ---
     v_safe = wp.max(v, V_BLEND_MIN)
     inv_v = 1.0 / v_safe
+    g_lr_a = G * lr - accel * H_CG
+    g_lf_a = G * lf + accel * H_CG
+    cf_a = C_SF * g_lr_a
+    cr_a = C_SR * g_lf_a
+    lf_cf = lf * cf_a
+    lr_cr = lr * cr_a
+    mm_il = mu * mass * inv_lwb / I_Z
+    m_vl = mu * inv_lwb * inv_v
 
-    # Linear slip angles (same approximation as before). Saturation in the
-    # force law handles the large-slip regime.
-    alpha_f = beta + lf * psip * inv_v - delta
-    alpha_r = beta - lr * psip * inv_v
-
-    # Vertical loads with longitudinal load transfer.
-    fzf = mass * (G * lr - accel * H_CG) * inv_lwb
-    fzr = mass * (G * lf + accel * H_CG) * inv_lwb
-    fmax_f = mu * fzf
-    fmax_r = mu * fzr
-
-    # Saturating lateral tire force:  small alpha -> F_y ~ -C_S * mu * F_z * alpha
-    #                                  large alpha -> F_y -> sign(-alpha) * mu * F_z
-    f_yf = -fmax_f * wp.tanh(C_SF * alpha_f)
-    f_yr = -fmax_r * wp.tanh(C_SR * alpha_r)
-
-    dpsip_d = (lf * f_yf - lr * f_yr) / I_Z
-    dbeta_d = (f_yf + f_yr) / (mass * v_safe) - psip
+    dpsip_d = (
+        -mm_il * inv_v * (lf * lf_cf + lr * lr_cr) * psip
+        + mm_il * (lr_cr - lf_cf) * beta
+        + mm_il * lf_cf * delta
+    )
+    dbeta_d = (
+        (m_vl * inv_v * (lr_cr - lf_cf) - 1.0) * psip
+        - m_vl * (cr_a + cf_a) * beta
+        + m_vl * cf_a * delta
+    )
     cb = wp.cos(beta)
     sb = wp.sin(beta)
     dx_d = v * (cb * cp - sb * sp)
@@ -336,19 +336,9 @@ def step_kernel(
         * PROGRESS_SCALE
         * (1.0 + wp.max(v_along, 0.0) / PROGRESS_V_COEF)
     )
-    wall = -WALL_PENALTY_COEF * wp.exp(-WALL_PENALTY_RATE * edt_val)
 
-    # Rear slip angle penalty: discourages drifting without forbidding it
-    lr_eff = LR * lr_s
-    v_slip = wp.max(v, 2.0)
-    alpha_r = wp.atan((lr_eff * psip - v * wp.sin(beta)) / (v_slip * wp.cos(beta)))
-    excess = wp.max(wp.abs(alpha_r) - SLIP_THRESHOLD, 0.0)
-    slip_pen = -SLIP_PENALTY_COEF * excess * excess
-
-    steer_ratio = steer_v / STEER_V_MAX
-    steer_pen = -STEER_PENALTY_COEF * steer_ratio * steer_ratio
     term_pen = wp.where(term, -TERM_PENALTY, 0.0)
-    reward[i] = progress + wall + slip_pen + steer_pen + term_pen
+    reward[i] = progress + term_pen
 
     if term:
         done[i] = DONE_TERMINATED
