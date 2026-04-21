@@ -781,7 +781,7 @@ class Agent(nn.Module):
 
     def _dist(self, obs):
         mean = self.actor(obs)
-        log_std = self.actor_logstd.expand_as(mean).clamp(-5.0, -0.3)
+        log_std = self.actor_logstd.expand_as(mean).clamp(-1.6, -0.3)
         return Normal(mean, log_std.exp())
 
     def act_value(self, obs, action=None, need_entropy: bool = True):
@@ -1076,7 +1076,7 @@ def train(
                 nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
                 optimizer.step()
                 with torch.no_grad():
-                    agent.actor_logstd.clamp_(-5.0, -0.3)
+                    agent.actor_logstd.clamp_(-1.6, -0.3)
 
                 pg_t += pg_loss.detach()
                 v_t += v_loss.detach()
