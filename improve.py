@@ -252,7 +252,7 @@ def main(
     num_envs: int = 4096,
     train_timeout_s: int = 3600,
     verify_steps: int = 4000,
-    model: str = "google/gemma-4-27b-it",
+    model: str = "google/gemma-4-31B-it",
     max_context_bytes: int = 0,
 ):
     from transformers import AutoModelForCausalLM, AutoTokenizer
