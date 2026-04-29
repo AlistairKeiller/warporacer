@@ -1,3 +1,6 @@
+"""Single-file PPO + Warp racing trainer."""
+
+import json
 import time
 from collections import deque
 from pathlib import Path
@@ -26,12 +29,12 @@ from yaml import safe_load
 
 import wandb
 
+# Vehicle
 MU = 1.0489
 LF = 0.15875
 LR = 0.17145
 LWB = LF + LR
 MASS = 3.74
-
 STEER_MIN = -0.4189
 STEER_MAX = 0.4189
 STEER_V_MAX = 3.2
@@ -40,8 +43,6 @@ V_MIN = -5.0
 V_MAX = 20.0
 PSI_PRIME_MAX = 6.0
 BETA_MAX = 1.2
-
-# Car
 WIDTH = 0.31
 LENGTH = 0.58
 CAR_HALF_DIAG = float(np.hypot(WIDTH / 2.0, LENGTH / 2.0))
@@ -51,13 +52,10 @@ SUBSTEPS = 6
 DT_SUB = DT / float(SUBSTEPS)
 DT_SUB_HALF = DT_SUB * 0.5
 DT_SUB_SIX = DT_SUB / 6.0
-
 DR_FRAC = 0.15
-
 PROGRESS_SCALE = 100.0
 PROGRESS_V_COEF = 10.0
 TERM_PENALTY = 10.0
-
 NUM_LIDAR = 108
 LIDAR_FOV = np.radians(270.0)
 LIDAR_RANGE = 20.0
@@ -67,7 +65,6 @@ OBS_LOOK_OFF = OBS_FRENET_OFF + 2
 OBS_DIM = OBS_LOOK_OFF + 2 * NUM_LOOKAHEAD
 ACT_DIM = 2
 MAX_STEPS = 10_000
-
 OCC_THRESH = 230
 SMOOTH_WINDOW = 51
 ADJ = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
@@ -104,15 +101,12 @@ def st_deriv(
     lwb = lf + lr
     mu = MU * mu_s
     a_max = mu * G
-
     tand = wp.tan(delta)
     d_psi_kin = v * tand / lwb
     d_psi_cap = a_max / wp.max(wp.abs(v), 0.5)
     d_psi = wp.clamp(d_psi_kin, -d_psi_cap, d_psi_cap)
-
     a_lat = v * d_psi
     a_long_max = wp.sqrt(wp.max(a_max * a_max - a_lat * a_lat, 0.0))
-
     cp = wp.cos(psi)
     sp = wp.sin(psi)
     out = VDeriv()
@@ -141,7 +135,6 @@ def rk4_step(
 ) -> VDeriv:
     dd = steer_v * DT_SUB_HALF
     dd_full = steer_v * DT_SUB
-
     k1 = st_deriv(delta, v, psi, psip, beta, steer_v, accel, mu_s, mass_s, lf_s, lr_s)
     k2 = st_deriv(
         delta + dd,
@@ -229,12 +222,10 @@ def step_kernel(
     mass_s = car_dr[i, 1]
     lf_s = car_dr[i, 2]
     lr_s = car_dr[i, 3]
-
     mw = dt_map.shape[0]
     mh = dt_map.shape[1]
     mh_f = wp.float32(mh) - 1.0
 
-    # Input
     steer_v = wp.clamp(actions[i][0], -1.0, 1.0) * STEER_V_MAX
     if (steer_v < 0.0 and delta <= STEER_MIN) or (steer_v > 0.0 and delta >= STEER_MAX):
         steer_v = 0.0
@@ -245,17 +236,7 @@ def step_kernel(
     dd_sub = steer_v * DT_SUB
     for _ in range(SUBSTEPS):
         d = rk4_step(
-            delta,
-            v,
-            psi,
-            psip,
-            beta,
-            steer_v,
-            accel,
-            mu_s,
-            mass_s,
-            lf_s,
-            lr_s,
+            delta, v, psi, psip, beta, steer_v, accel, mu_s, mass_s, lf_s, lr_s
         )
         x += d.d_x
         y += d.d_y
@@ -270,21 +251,18 @@ def step_kernel(
     psip = wp.clamp(psip, -PSI_PRIME_MAX, PSI_PRIME_MAX)
     beta = wp.clamp(beta, -BETA_MAX, BETA_MAX)
 
-    # Reward + done
     px = wp.clamp(wp.int32((x - origin[0]) / res), 0, mw - 1)
     py = wp.clamp(wp.int32(mh_f - (y - origin[1]) / res), 0, mh - 1)
     edt_val = dt_map[px, py] * res
     term = edt_val < CAR_HALF_DIAG
     trunc = steps >= MAX_STEPS
     steps += 1
-
     new_wp = cl_lut[px, py]
     d_wp = new_wp - wp_i
     if 2 * d_wp > n_cl:
         d_wp -= n_cl
     elif 2 * d_wp < -n_cl:
         d_wp += n_cl
-
     cth = centerline[new_wp][2]
     v_along = v * wp.cos(beta + psi - cth)
     progress = (
@@ -293,10 +271,8 @@ def step_kernel(
         * PROGRESS_SCALE
         * (1.0 + wp.max(v_along, 0.0) / PROGRESS_V_COEF)
     )
-
     term_pen = wp.where(term, -TERM_PENALTY, 0.0)
     reward[i] = progress + term_pen
-
     if term:
         done[i] = DONE_TERMINATED
     elif trunc:
@@ -304,7 +280,6 @@ def step_kernel(
     else:
         done[i] = 0
 
-    # Reset
     if term or trunc:
         rng = wp.rand_init(seed_base + i * 73 + steps * 31 + new_wp * 17)
         rnd = wp.int32(wp.randf(rng) * wp.float32(n_cl)) % n_cl
@@ -323,7 +298,6 @@ def step_kernel(
         car_dr[i, 2] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 3] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
 
-    # Lidar
     sh = wp.sin(psi)
     ch = wp.cos(psi)
     lx = x + LF * ch
@@ -350,7 +324,6 @@ def step_kernel(
                 break
         obs[i, 3 + j] = wp.min(dist, lrange_px) * res
 
-    # Frenet + lookahead
     cpt = centerline[new_wp]
     cx_p = cpt[0]
     cy_p = cpt[1]
@@ -361,7 +334,6 @@ def step_kernel(
     lateral_err = -(x - cx_p) * s_cth + (y - cy_p) * c_cth
     obs[i, OBS_FRENET_OFF] = heading_err
     obs[i, OBS_FRENET_OFF + 1] = lateral_err
-
     idx = new_wp
     for k in range(NUM_LOOKAHEAD):
         idx += look_step
@@ -387,11 +359,10 @@ def step_kernel(
     cars_int[i, 1] = new_wp
 
 
-# Map
 class Map:
     def __init__(self, path: Path):
-        self.meta = safe_load(path.read_text())
-        img_path = path.parent / self.meta["image"]
+        self.meta = safe_load(Path(path).read_text())
+        img_path = Path(path).parent / self.meta["image"]
         self.raw = imread(str(img_path), IMREAD_GRAYSCALE)
         if self.raw is None:
             raise FileNotFoundError(img_path)
@@ -468,18 +439,15 @@ class Map:
         )[1].reshape(rows.shape)
 
 
-# Env
 class RacingEnv:
     action_space = gym.spaces.Box(-1.0, 1.0, (ACT_DIM,), np.float32)
     observation_space = gym.spaces.Box(-np.inf, np.inf, (OBS_DIM,), np.float32)
 
-    def __init__(
-        self, map_path: Path, num_envs: int, seed: int = 0, device: str | None = None
-    ):
+    def __init__(self, map_path, num_envs, seed=0, device=None):
         wp.init()
         self.num_envs = num_envs
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.map = Map(map_path)
+        self.map = Map(Path(map_path))
         self.look_step = self.map.look_step
         self.seed_base = int(seed)
         d = self.device
@@ -504,14 +472,12 @@ class RacingEnv:
         dr_init = (
             1.0 - DR_FRAC + 2.0 * DR_FRAC * rng.random((num_envs, 4), dtype=np.float32)
         )
-
         self.cars = wp.array(cars, dtype=float, device=d)
         self.cars_int = wp.array(cars_int, dtype=int, device=d)
         self.car_dr = wp.array(dr_init, dtype=float, device=d)
         self.obs = wp.zeros((num_envs, OBS_DIM), dtype=float, device=d)
         self.rew = wp.zeros(num_envs, dtype=float, device=d)
         self.done = wp.zeros(num_envs, dtype=int, device=d)
-
         self.obs_buf = wp.to_torch(self.obs)
         self.rew_buf = wp.to_torch(self.rew)
         self.done_buf = wp.to_torch(self.done)
@@ -527,7 +493,7 @@ class RacingEnv:
         )
         self._zero_act = wp.zeros(num_envs, dtype=wp.vec2, device=d)
         self._call = 0
-        # Warm-up reset
+
         self._launch(self._zero_act)
         self._sanitize()
         self._step_counter.zero_()
@@ -597,9 +563,7 @@ class RacingEnv:
         return {
             k: getattr(self, k).clone()
             for k in ("cars_buf", "cars_int_buf", "obs_buf", "rew_buf", "done_buf")
-        } | {
-            "car_dr": wp.to_torch(self.car_dr).clone(),
-        }
+        } | {"car_dr": wp.to_torch(self.car_dr).clone()}
 
     def restore_state(self, s):
         self.cars_buf.copy_(s["cars_buf"])
@@ -610,7 +574,7 @@ class RacingEnv:
         self.done_buf.copy_(s["done_buf"])
 
 
-# PPO components
+# PPO
 class RunningMeanStd:
     def __init__(self, shape, device):
         self.mean = torch.zeros(shape, dtype=torch.float32, device=device)
@@ -631,7 +595,7 @@ class RunningMeanStd:
         self.count = tot
         self.inv_std = torch.rsqrt(self.var + 1e-8)
 
-    def normalize(self, x, clip: float = 10.0):
+    def normalize(self, x, clip=10.0):
         return ((x - self.mean) * self.inv_std).clamp(-clip, clip)
 
 
@@ -715,7 +679,6 @@ class KLAdaptiveLR:
         return self.opt.param_groups[0]["lr"]
 
 
-# Rollout video
 def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
     snap = env.save_state()
     was_training = agent.training
@@ -775,7 +738,6 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
         agent.train(was_training)
 
 
-# PPO training
 def train(
     env,
     agent,
@@ -795,6 +757,7 @@ def train(
     log_dir=Path("./logs"),
     record_every=100,
     record_steps=1800,
+    use_wandb=True,
 ):
     device = next(agent.parameters()).device
     N = env.num_envs
@@ -821,6 +784,7 @@ def train(
     global_step = 0
     t0 = time.time()
     last_t = t0
+    last_log = {}
 
     for it in range(iterations):
         agent.eval()
@@ -849,7 +813,6 @@ def train(
                 obs = obs_rms.normalize(raw)
             next_val = agent.value(obs)
 
-        # GAE
         val_ext = torch.cat([val_b, next_val.unsqueeze(0)], 0)
         adv_b = torch.zeros_like(rew_b)
         last = torch.zeros_like(next_val)
@@ -862,7 +825,6 @@ def train(
         ret_b = adv_b + val_b
         global_step += rollouts * N
 
-        # Flatten
         B = rollouts * N
         b_obs = obs_b.reshape(B, OBS_DIM)
         b_act = act_b.reshape(B, ACT_DIM)
@@ -871,11 +833,11 @@ def train(
         b_ret = ret_b.reshape(B)
         b_val = val_b.reshape(B)
         mb = B // minibatches
-
         agent.train()
         stats = {"pg": 0.0, "v": 0.0, "ent": 0.0, "kl": 0.0, "clipfrac": 0.0}
         n_upd = 0
         kl_stop = False
+
         for epoch in range(epochs):
             perm = torch.randperm(B, device=device)
             epoch_kl = 0.0
@@ -893,7 +855,6 @@ def train(
                 s1 = ratio * adv_mb
                 s2 = ratio.clamp(1 - clip, 1 + clip) * adv_mb
                 pg = -torch.min(s1, s2).mean()
-
                 v_err = new_val - b_ret[idx]
                 if vf_clip > 0:
                     v_clipped = b_val[idx] + (new_val - b_val[idx]).clamp(
@@ -924,6 +885,7 @@ def train(
             if epoch_kl / max(minibatches, 1) > 1.5 * target_kl:
                 kl_stop = True
                 break
+
         for k in stats:
             stats[k] /= max(n_upd, 1)
         sched.step(stats["kl"])
@@ -946,10 +908,12 @@ def train(
         if finished_rets:
             log["ep_return"] = float(np.mean(finished_rets))
             log["ep_length"] = float(np.mean(finished_lens))
-        try:
-            wandb.log(log, step=global_step)
-        except Exception:
-            pass
+        last_log = log
+        if use_wandb:
+            try:
+                wandb.log(log, step=global_step)
+            except Exception:
+                pass
         if it % 10 == 0:
             er = log.get("ep_return", float("nan"))
             print(
@@ -961,12 +925,15 @@ def train(
             out = log_dir / f"rollout_iter{it + 1:06d}.mp4"
             try:
                 record_rollout(env, agent, record_steps, out, obs_rms=obs_rms)
-                wandb.log(
-                    {"rollout": wandb.Video(str(out), format="mp4")}, step=global_step
-                )
+                if use_wandb:
+                    wandb.log(
+                        {"rollout": wandb.Video(str(out), format="mp4")},
+                        step=global_step,
+                    )
             except Exception as e:
                 print(f"[rollout {it + 1}] failed: {e}")
-    return time.time() - t0, obs_rms, ret_rms, global_step
+
+    return time.time() - t0, obs_rms, ret_rms, global_step, last_log
 
 
 def main(
@@ -978,8 +945,12 @@ def main(
     device: str = "",
     record_every: int = 100,
     record_steps: int = 1800,
-    use_wandb: bool = True,
+    no_wandb: bool = False,
+    no_record: bool = False,
 ):
+    use_wandb = not no_wandb
+    if no_record:
+        record_every = 0
     log_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -1005,17 +976,20 @@ def main(
             )
         except Exception as e:
             print(f"[wandb] init failed: {e}")
+            use_wandb = False
 
-    elapsed, obs_rms, ret_rms, step = train(
+    elapsed, obs_rms, ret_rms, step, last_log = train(
         env,
         agent,
         iterations=iterations,
         log_dir=log_dir,
         record_every=record_every,
         record_steps=record_steps,
+        use_wandb=use_wandb,
     )
     print(f"[done] {elapsed:.1f}s")
 
+    ckpt_path = log_dir / "agent_final.pt"
     torch.save(
         {
             "agent": agent.state_dict(),
@@ -1023,15 +997,41 @@ def main(
             "obs_var": obs_rms.var.cpu(),
             "obs_count": obs_rms.count,
         },
-        log_dir / "agent_final.pt",
+        ckpt_path,
     )
 
-    out = log_dir / "rollout_final.mp4"
-    record_rollout(env, agent, record_steps, out, obs_rms=obs_rms)
-    try:
-        wandb.log({"rollout_final": wandb.Video(str(out), format="mp4")}, step=step)
-    except Exception:
-        pass
+    if not no_record:
+        try:
+            record_rollout(
+                env, agent, record_steps, log_dir / "rollout_final.mp4", obs_rms=obs_rms
+            )
+            if use_wandb:
+                wandb.log(
+                    {
+                        "rollout_final": wandb.Video(
+                            str(log_dir / "rollout_final.mp4"), format="mp4"
+                        )
+                    },
+                    step=step,
+                )
+        except Exception as e:
+            print(f"[final rollout] failed: {e}")
+
+    (log_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "final_ep_return": float(last_log.get("ep_return", float("nan"))),
+                "sps": int(last_log.get("sps", 0)),
+                "elapsed_s": float(elapsed),
+                "iterations": iterations,
+                "num_envs": num_envs,
+                "global_step": int(step),
+                "checkpoint": str(ckpt_path),
+                "lines_of_code": len(Path(__file__).read_text().splitlines()),
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":
