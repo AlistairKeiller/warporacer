@@ -280,15 +280,38 @@ def main(
     model: str = "google/gemma-4-31B-it",
     max_context_bytes: int = 0,
     max_new_tokens: int = 6000,
-    load_in_4bit: bool = False,
+    load_in_4bit: bool = True,
 ):
+    import sys
     import traceback
 
     from transformers import AutoModelForCausalLM, AutoProcessor
 
-    processor = AutoProcessor.from_pretrained(model)
-    load_kw = {"dtype": "auto", "device_map": "auto"}
-    if load_in_4bit:
+    # Loud startup diagnostics so we never silently end up in a bad config.
+    print(f"[env] python   = {sys.executable}")
+    try:
+        import bitsandbytes as _bnb
+
+        print(f"[env] bnb      = {_bnb.__version__}")
+        bnb_ok = True
+    except ImportError:
+        print(f"[env] bnb      = NOT INSTALLED  (`pip install bitsandbytes`)")
+        bnb_ok = False
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        free, total = torch.cuda.mem_get_info()
+        print(f"[env] GPU free = {free / 1e9:.1f} / {total / 1e9:.1f} GB")
+        if free < total * 0.85:
+            print(
+                f"[env] WARNING: only {free / 1e9:.0f} GB free - another "
+                f"process is probably holding GPU memory. Run `nvidia-smi` "
+                f"and kill stale python/torch processes, then retry."
+            )
+            raise SystemExit(1)
+
+    use_4bit = load_in_4bit and bnb_ok
+    load_kw = {"device_map": "auto"}
+    if use_4bit:
         from transformers import BitsAndBytesConfig
 
         load_kw["quantization_config"] = BitsAndBytesConfig(
@@ -297,8 +320,31 @@ def main(
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
         )
-        load_kw.pop("dtype")  # incompatible with quantization_config
+        print(f"[load] mode = 4-bit NF4 (~16 GB model, ~80 GB for KV cache)")
+        effective_ctx = max_context_bytes or None
+    else:
+        load_kw["dtype"] = "auto"
+        print(f"[load] mode = bf16 (~62 GB model, ~33 GB for KV cache)")
+        if load_in_4bit and not bnb_ok:
+            print(
+                f"[load] >>> 4-bit was requested but bitsandbytes is "
+                f"missing. Install it (`pip install bitsandbytes`) for "
+                f"full context. Otherwise capping prompt aggressively."
+            )
+        # bf16 31B + full warp examples KV cache won't fit in 95 GB. Force a cap.
+        effective_ctx = max_context_bytes or 80_000
+        if max_context_bytes == 0:
+            print(
+                f"[load] auto-cap = {effective_ctx} bytes "
+                f"(~20K tokens). Override with --max-context-bytes."
+            )
+
+    processor = AutoProcessor.from_pretrained(model)
     mdl = AutoModelForCausalLM.from_pretrained(model, **load_kw)
+
+    if torch.cuda.is_available():
+        free, total = torch.cuda.mem_get_info()
+        print(f"[env] GPU free after model load: {free / 1e9:.1f} GB")
 
     # Baseline.
     base = RUNS / "baseline"
@@ -325,7 +371,7 @@ def main(
                 processor,
                 mdl,
                 MAIN.read_text(),
-                max_context_bytes=max_context_bytes or None,
+                max_context_bytes=effective_ctx,
                 max_new_tokens=max_new_tokens,
             )
             (cd / "main.py").write_text(new)
