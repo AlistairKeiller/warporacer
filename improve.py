@@ -34,7 +34,7 @@ RUNS.mkdir(exist_ok=True)
 PPO_CACHE = ROOT / ".cache_cleanrl_ppo.py"
 PPO_URL = "https://raw.githubusercontent.com/vwxyzjn/cleanrl/master/cleanrl/ppo.py"
 
-INSTRUCTIONS = """You are an expert in PyTorch + NVIDIA Warp + PPO. Below are reference examples followed by a single-file racing trainer (main.py). Rewrite main.py to be SHORTER or FASTER (higher steps/sec).
+SYSTEM = """You are an expert in PyTorch + NVIDIA Warp + PPO. The user will give you reference Warp examples, the CleanRL PPO implementation, and a single-file racing trainer (main.py). Rewrite main.py to be SHORTER or FASTER (higher steps/sec).
 
 Hard constraints (the verifier will reject violations):
 - DO NOT change MU, LF, LR, A_MAX, STEER_*, V_*, WIDTH, LENGTH, DT, G, SUBSTEPS, or the friction-circle clamp logic.
@@ -78,7 +78,7 @@ def cleanrl_ppo_text() -> str:
     return PPO_CACHE.read_text()
 
 
-def build_prompt(code: str, max_bytes: int | None) -> str:
+def build_user_message(code: str, max_bytes: int | None) -> str:
     ctx_parts = [
         "# Reference: NVIDIA Warp examples",
         warp_examples_text(),
@@ -88,42 +88,46 @@ def build_prompt(code: str, max_bytes: int | None) -> str:
     ctx = "\n\n".join(p for p in ctx_parts if p)
     if max_bytes and len(ctx) > max_bytes:
         ctx = ctx[:max_bytes] + "\n\n[... reference truncated ...]"
-    return (
-        INSTRUCTIONS
-        + "\n\n"
-        + ctx
-        + "\n\n# File to rewrite: main.py\n```python\n"
-        + code
-        + "\n```"
-    )
+    return ctx + "\n\n# File to rewrite: main.py\n```python\n" + code + "\n```"
 
 
-def ask(model, tok, code: str, max_context_bytes: int | None = None) -> str:
-    user = build_prompt(code, max_context_bytes)
-    # Two-step pattern: render template to string, then tokenize. This is
-    # more robust than apply_chat_template(..., return_tensors='pt') across
-    # tokenizer/model versions, and survives device_map='auto' sharding.
-    text = tok.apply_chat_template(
-        [{"role": "user", "content": user}],
-        add_generation_prompt=True,
+def ask(processor, model, code: str, max_context_bytes: int | None = None) -> str:
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": build_user_message(code, max_context_bytes)},
+    ]
+    # Gemma 4 docs: render template -> tokenize via processor -> generate.
+    text = processor.apply_chat_template(
+        messages,
         tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
     )
     device = next(model.parameters()).device
-    enc = tok(text, return_tensors="pt").to(device)
-    out = model.generate(
-        **enc,
+    inputs = processor(text=text, return_tensors="pt").to(device)
+    input_len = inputs["input_ids"].shape[-1]
+    outputs = model.generate(
+        **inputs,
         max_new_tokens=12000,
         do_sample=True,
-        temperature=0.6,
-        pad_token_id=(tok.pad_token_id or tok.eos_token_id),
+        temperature=1.0,
+        top_p=0.95,
+        top_k=64,
     )
-    response = tok.decode(
-        out[0][enc["input_ids"].shape[1] :],
-        skip_special_tokens=True,
+    raw = processor.decode(outputs[0][input_len:], skip_special_tokens=False)
+    # parse_response strips Gemma 4 thought-channel framing tokens.
+    parsed = (
+        processor.parse_response(raw) if hasattr(processor, "parse_response") else raw
     )
-    blocks = re.findall(r"```(?:python)?\s*\n(.*?)\n```", response, re.S)
+    if isinstance(parsed, dict):
+        parsed = parsed.get("content") or parsed.get("response") or str(parsed)
+    elif not isinstance(parsed, str):
+        parsed = str(parsed)
+    blocks = re.findall(r"```(?:python)?\s*\n(.*?)\n```", parsed, re.S)
     if not blocks:
-        raise ValueError("no fenced code block in response")
+        raise ValueError(
+            f"no fenced code block in response (first 500 chars):\n{parsed[:500]}"
+        )
     src = max(blocks, key=len)  # the rewrite is the largest block
     ast.parse(src)  # raises SyntaxError if malformed
     return src
@@ -267,17 +271,17 @@ def main(
     train_timeout_s: int = 7200,
     verify_steps: int = 4000,
     friction_tol: float = 0.05,
-    model: str = "google/gemma-4-27b-it",
+    model: str = "google/gemma-4-31B-it",
     max_context_bytes: int = 0,
 ):
     import traceback
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoProcessor
 
-    tok = AutoTokenizer.from_pretrained(model)
+    processor = AutoProcessor.from_pretrained(model)
     mdl = AutoModelForCausalLM.from_pretrained(
         model,
-        torch_dtype="auto",
+        dtype="auto",
         device_map="auto",
     )
 
@@ -303,7 +307,10 @@ def main(
         cd.mkdir(exist_ok=True)
         try:
             new = ask(
-                mdl, tok, MAIN.read_text(), max_context_bytes=max_context_bytes or None
+                processor,
+                mdl,
+                MAIN.read_text(),
+                max_context_bytes=max_context_bytes or None,
             )
             (cd / "main.py").write_text(new)
             tres = train(
