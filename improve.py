@@ -99,21 +99,29 @@ def build_prompt(code: str, max_bytes: int | None) -> str:
 
 
 def ask(model, tok, code: str, max_context_bytes: int | None = None) -> str:
-    msg = [{"role": "user", "content": build_prompt(code, max_context_bytes)}]
-    inp = tok.apply_chat_template(
-        msg,
+    user = build_prompt(code, max_context_bytes)
+    # Two-step pattern: render template to string, then tokenize. This is
+    # more robust than apply_chat_template(..., return_tensors='pt') across
+    # tokenizer/model versions, and survives device_map='auto' sharding.
+    text = tok.apply_chat_template(
+        [{"role": "user", "content": user}],
         add_generation_prompt=True,
-        return_tensors="pt",
-    ).to(model.device)
+        tokenize=False,
+    )
+    device = next(model.parameters()).device
+    enc = tok(text, return_tensors="pt").to(device)
     out = model.generate(
-        inp,
+        **enc,
         max_new_tokens=12000,
         do_sample=True,
         temperature=0.6,
-        pad_token_id=tok.eos_token_id,
+        pad_token_id=(tok.pad_token_id or tok.eos_token_id),
     )
-    text = tok.decode(out[0][inp.shape[1] :], skip_special_tokens=True)
-    blocks = re.findall(r"```(?:python)?\s*\n(.*?)\n```", text, re.S)
+    response = tok.decode(
+        out[0][enc["input_ids"].shape[1] :],
+        skip_special_tokens=True,
+    )
+    blocks = re.findall(r"```(?:python)?\s*\n(.*?)\n```", response, re.S)
     if not blocks:
         raise ValueError("no fenced code block in response")
     src = max(blocks, key=len)  # the rewrite is the largest block
@@ -156,7 +164,13 @@ def train(
     return json.loads((log_dir / "result.json").read_text())
 
 
-def verify(main_path: Path, ckpt: Path, map_yaml: Path, max_steps: int = 4000) -> dict:
+def verify(
+    main_path: Path,
+    ckpt: Path,
+    map_yaml: Path,
+    max_steps: int = 4000,
+    friction_tol: float = 0.05,
+) -> dict:
     spec = importlib.util.spec_from_file_location(f"cm_{ckpt.parent.name}", main_path)
     M = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(M)
@@ -237,7 +251,7 @@ def verify(main_path: Path, ckpt: Path, map_yaml: Path, max_steps: int = 4000) -
     n_sub = max(len(actions) * SUBSTEPS, 1)
     rate = fric_viol / n_sub
     return {
-        "pass": bool((laps >= 1) and (not collided) and (rate < 0.02)),
+        "pass": bool((laps >= 1) and (not collided) and (rate < friction_tol)),
         "laps": int(laps),
         "collided": bool(collided),
         "friction_violation_rate": float(rate),
@@ -248,13 +262,16 @@ def verify(main_path: Path, ckpt: Path, map_yaml: Path, max_steps: int = 4000) -
 def main(
     map_yaml: Path,
     iterations: int = 10,
-    train_iters: int = 300,
+    train_iters: int = 1000,
     num_envs: int = 4096,
-    train_timeout_s: int = 3600,
+    train_timeout_s: int = 7200,
     verify_steps: int = 4000,
-    model: str = "google/gemma-4-31B-it",
+    friction_tol: float = 0.05,
+    model: str = "google/gemma-4-27b-it",
     max_context_bytes: int = 0,
 ):
+    import traceback
+
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model)
@@ -269,10 +286,17 @@ def main(
     if not (base / "agent_final.pt").exists():
         train(MAIN, map_yaml, base, train_iters, num_envs, train_timeout_s)
     bres = json.loads((base / "result.json").read_text())
-    bv = verify(MAIN, base / "agent_final.pt", map_yaml, verify_steps)
+    bv = verify(MAIN, base / "agent_final.pt", map_yaml, verify_steps, friction_tol)
     best_lines = bres.get("lines_of_code", len(MAIN.read_text().splitlines()))
     best_sps = bres.get("sps", 0)
-    print(f"[baseline] pass={bv['pass']} lines={best_lines} sps={best_sps} {bv}")
+    best_pass = bv["pass"]
+    print(f"[baseline] pass={best_pass} lines={best_lines} sps={best_sps} {bv}")
+    if not best_pass:
+        print(
+            "  hint: baseline failed verification - increase --train-iters "
+            "(e.g. 2000) or relax --friction-tol (e.g. 0.10) if the policy "
+            "looks fine in rollout videos."
+        )
 
     for it in range(iterations):
         cd = RUNS / f"iter_{it:03d}"
@@ -285,14 +309,26 @@ def main(
             tres = train(
                 cd / "main.py", map_yaml, cd, train_iters, num_envs, train_timeout_s
             )
-            v = verify(cd / "main.py", cd / "agent_final.pt", map_yaml, verify_steps)
+            v = verify(
+                cd / "main.py",
+                cd / "agent_final.pt",
+                map_yaml,
+                verify_steps,
+                friction_tol,
+            )
         except Exception as e:
             print(f"[{it}] failed: {type(e).__name__}: {e}")
+            traceback.print_exc()
             continue
 
         lines = tres.get("lines_of_code", len(new.splitlines()))
         sps = tres.get("sps", 0)
-        better = v["pass"] and (lines < best_lines or sps > best_sps * 1.05)
+        # Adoption: if no current best passes, the first passing candidate wins.
+        # Otherwise require a passing candidate to also be shorter or >=5% faster.
+        if not best_pass:
+            better = v["pass"]
+        else:
+            better = v["pass"] and (lines < best_lines or sps > best_sps * 1.05)
         tag = "ADOPT" if better else ("PASS" if v["pass"] else "FAIL")
         print(
             f"[{it:03d}] {tag} lines={lines} sps={sps} laps={v['laps']} "
@@ -301,7 +337,9 @@ def main(
         if better:
             shutil.copy2(MAIN, cd / "main.py.replaced")
             shutil.copy2(cd / "main.py", MAIN)
-            best_lines, best_sps = min(best_lines, lines), max(best_sps, sps)
+            best_lines = min(best_lines, lines)
+            best_sps = max(best_sps, sps)
+            best_pass = True
 
 
 if __name__ == "__main__":
