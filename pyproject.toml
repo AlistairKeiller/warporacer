@@ -15,6 +15,7 @@ dependencies = [
     "scipy>=1.17.1",
     "skrl>=2.0.0",
     "torch>=2.11.0",
+    "torchvision>=0.26.0",
     "transformers>=5.7.0",
     "typer>=0.24.1",
     "wandb>=0.26.0",
