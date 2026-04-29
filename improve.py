@@ -60,7 +60,7 @@ def ask(model: str, code: str, num_ctx: int) -> str:
             "stream": False,
             "options": {
                 "num_ctx": num_ctx,
-                "temperature": 1.0,
+                "temperature": 0.4,
                 "top_p": 0.95,
                 "top_k": 64,
             },
@@ -200,7 +200,7 @@ def main(
     verify_steps: int = 4000,
     friction_tol: float = 0.05,
     model: str = "qwen3-coder:30b",
-    num_ctx: int = 32_768,
+    num_ctx: int = 65_536,
 ):
     base = RUNS / "baseline"
     if not (base / "agent_final.pt").exists():
