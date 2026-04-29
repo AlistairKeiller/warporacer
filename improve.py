@@ -91,7 +91,13 @@ def build_user_message(code: str, max_bytes: int | None) -> str:
     return ctx + "\n\n# File to rewrite: main.py\n```python\n" + code + "\n```"
 
 
-def ask(processor, model, code: str, max_context_bytes: int | None = None) -> str:
+def ask(
+    processor,
+    model,
+    code: str,
+    max_context_bytes: int | None = None,
+    max_new_tokens: int = 6000,
+) -> str:
     messages = [
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": build_user_message(code, max_context_bytes)},
@@ -108,7 +114,7 @@ def ask(processor, model, code: str, max_context_bytes: int | None = None) -> st
     input_len = inputs["input_ids"].shape[-1]
     outputs = model.generate(
         **inputs,
-        max_new_tokens=12000,
+        max_new_tokens=max_new_tokens,
         do_sample=True,
         temperature=1.0,
         top_p=0.95,
@@ -273,17 +279,26 @@ def main(
     friction_tol: float = 0.05,
     model: str = "google/gemma-4-31B-it",
     max_context_bytes: int = 0,
+    max_new_tokens: int = 6000,
+    load_in_4bit: bool = False,
 ):
     import traceback
 
     from transformers import AutoModelForCausalLM, AutoProcessor
 
     processor = AutoProcessor.from_pretrained(model)
-    mdl = AutoModelForCausalLM.from_pretrained(
-        model,
-        dtype="auto",
-        device_map="auto",
-    )
+    load_kw = {"dtype": "auto", "device_map": "auto"}
+    if load_in_4bit:
+        from transformers import BitsAndBytesConfig
+
+        load_kw["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype="bfloat16",
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+        load_kw.pop("dtype")  # incompatible with quantization_config
+    mdl = AutoModelForCausalLM.from_pretrained(model, **load_kw)
 
     # Baseline.
     base = RUNS / "baseline"
@@ -311,6 +326,7 @@ def main(
                 mdl,
                 MAIN.read_text(),
                 max_context_bytes=max_context_bytes or None,
+                max_new_tokens=max_new_tokens,
             )
             (cd / "main.py").write_text(new)
             tres = train(
