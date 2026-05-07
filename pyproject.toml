@@ -7,8 +7,11 @@ requires-python = ">=3.14"
 dependencies = [
     "gymnasium>=1.2.3",
     "imageio[ffmpeg]>=2.37.3",
+    "imgui-bundle>=1.92.700",
     "numpy>=2.4.4",
     "opencv-python>=4.13.0.92",
+    "pyglet>=2.1.14",
+    "pyopengl>=3.1.10",
     "pyyaml>=6.0.3",
     "scikit-image>=0.26.0",
     "scipy>=1.17.1",

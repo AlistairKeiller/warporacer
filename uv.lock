@@ -304,6 +304,21 @@ wheels = [
 ]
 
 [[package]]
+name = "imgui-bundle"
+version = "1.92.700"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9e/70/8643e459bf814af02d6d76ba14e1af5e2119d81fc7e63f90ffc76d5e2d78/imgui_bundle-1.92.700.tar.gz", hash = "sha256:66150d0ee3bf2bfadb66dd7917b357b7916b15d423383ac2e8309a1d1a13cd07", size = 44549344, upload-time = "2026-04-26T23:36:31.814Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d6/74/57c0e1bd5b9b74d8694ed6bcd6a2e8109860bb152496500f2c031d3c34fb/imgui_bundle-1.92.700-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:532a0ee390f0611b7871a416650c55d30d3556e1e6a92d2f3af6f416facb198f", size = 9893642, upload-time = "2026-04-26T23:36:17.039Z" },
+    { url = "https://files.pythonhosted.org/packages/ca/36/173754c66655290b3d505936178d69a9b0ea043ef9f39683bbce7c767506/imgui_bundle-1.92.700-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:c2aaa5ec27e64f056a7429f5b66afe54a1800f2108257846495f343f4b91cc05", size = 11978586, upload-time = "2026-04-26T23:36:19.134Z" },
+    { url = "https://files.pythonhosted.org/packages/64/c2/1442e313b7349cd6ed702cf8f9eef85e875a11af29b023d848eb4b043fe5/imgui_bundle-1.92.700-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:9321ad5332b4fd29bb2e585822be95c44b287ac6705f00264e969d5fc7d6ccd7", size = 13067923, upload-time = "2026-04-26T23:36:21.427Z" },
+    { url = "https://files.pythonhosted.org/packages/58/98/cfe66ea72339b8b5e4475193bf11ed246b5b24a97efe5dd2c011921c9b0a/imgui_bundle-1.92.700-cp314-cp314-musllinux_1_2_aarch64.whl", hash = "sha256:47ae46048c34265162bfe4b5c5c36c59d18fbf9e155eb6458c956ae0b79c5a62", size = 13029483, upload-time = "2026-04-26T23:36:23.771Z" },
+    { url = "https://files.pythonhosted.org/packages/e8/8c/0d212d9dfc51e197f3a2bc755704345004a2938a7f62cc4bd6b67537e752/imgui_bundle-1.92.700-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:dcbb2b4f34cfcebef9f9168a493a0a8103096637b298ce725f7e6356e322a27b", size = 13928014, upload-time = "2026-04-26T23:36:25.637Z" },
+    { url = "https://files.pythonhosted.org/packages/54/d8/b6f5a92b04be2afa3f051a26403d0b4dafe402e987b1bed9555c5333088c/imgui_bundle-1.92.700-cp314-cp314-win_amd64.whl", hash = "sha256:eb6200640c78c553da9a08fbb67124578aa6bc0c1132b409f5fa4450e7e30cee", size = 11014755, upload-time = "2026-04-26T23:36:27.819Z" },
+    { url = "https://files.pythonhosted.org/packages/df/ae/3ce9f3db2a6802a8644e13dcca3474e6867178a476b8f67bcd379e15c697/imgui_bundle-1.92.700-cp314-cp314-win_arm64.whl", hash = "sha256:1afa31d125e3dc127527d0c87137013ef19757429c3b91696ceda295f609b6ba", size = 10654888, upload-time = "2026-04-26T23:36:29.722Z" },
+]
+
+[[package]]
 name = "jinja2"
 version = "3.1.6"
 source = { registry = "https://pypi.org/simple" }
@@ -746,12 +761,30 @@ wheels = [
 ]
 
 [[package]]
+name = "pyglet"
+version = "2.1.14"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e8/a6/ffd78b2d05a820ced85baa11210b8e5d0db0d951767021150be0a231df00/pyglet-2.1.14.tar.gz", hash = "sha256:feb3fba05a85f50f793688d88ddfbcdc57044d971f2d8d2107eb7578eb4af51e", size = 6595146, upload-time = "2026-04-05T08:24:35.549Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ae/d4/789d34a4674a4ccc0b65ad54d0f963f873d39000c3ebed0880574d5437e5/pyglet-2.1.14-py3-none-any.whl", hash = "sha256:70febf03f206607103e1f9806527019c589002626937aecdca4d095ce0a4b9b0", size = 1032928, upload-time = "2026-04-05T08:24:29.068Z" },
+]
+
+[[package]]
 name = "pygments"
 version = "2.20.0"
 source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/c3/b2/bc9c9196916376152d655522fdcebac55e66de6603a76a02bca1b6414f6c/pygments-2.20.0.tar.gz", hash = "sha256:6757cd03768053ff99f3039c1a36d6c0aa0b263438fcab17520b30a303a82b5f", size = 4955991, upload-time = "2026-03-29T13:29:33.898Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f4/7e/a72dd26f3b0f4f2bf1dd8923c85f7ceb43172af56d63c7383eb62b332364/pygments-2.20.0-py3-none-any.whl", hash = "sha256:81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176", size = 1231151, upload-time = "2026-03-29T13:29:30.038Z" },
+]
+
+[[package]]
+name = "pyopengl"
+version = "3.1.10"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6f/16/912b7225d56284859cd9a672827f18be43f8012f8b7b932bc4bd959a298e/pyopengl-3.1.10.tar.gz", hash = "sha256:c4a02d6866b54eb119c8e9b3fb04fa835a95ab802dd96607ab4cdb0012df8335", size = 1915580, upload-time = "2025-08-18T02:33:01.76Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/de/e4/1ba6f44e491c4eece978685230dde56b14d51a0365bc1b774ddaa94d14cd/pyopengl-3.1.10-py3-none-any.whl", hash = "sha256:794a943daced39300879e4e47bd94525280685f42dbb5a998d336cfff151d74f", size = 3194996, upload-time = "2025-08-18T02:32:59.902Z" },
 ]
 
 [[package]]
@@ -1142,8 +1175,11 @@ source = { virtual = "." }
 dependencies = [
     { name = "gymnasium" },
     { name = "imageio", extra = ["ffmpeg"] },
+    { name = "imgui-bundle" },
     { name = "numpy" },
     { name = "opencv-python" },
+    { name = "pyglet" },
+    { name = "pyopengl" },
     { name = "pyyaml" },
     { name = "scikit-image" },
     { name = "scipy" },
@@ -1159,8 +1195,11 @@ dependencies = [
 requires-dist = [
     { name = "gymnasium", specifier = ">=1.2.3" },
     { name = "imageio", extras = ["ffmpeg"], specifier = ">=2.37.3" },
+    { name = "imgui-bundle", specifier = ">=1.92.700" },
     { name = "numpy", specifier = ">=2.4.4" },
     { name = "opencv-python", specifier = ">=4.13.0.92" },
+    { name = "pyglet", specifier = ">=2.1.14" },
+    { name = "pyopengl", specifier = ">=3.1.10" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "scikit-image", specifier = ">=0.26.0" },
     { name = "scipy", specifier = ">=1.17.1" },
