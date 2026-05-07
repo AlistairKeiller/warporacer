@@ -8,8 +8,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import warp as wp
-import warp.render
-import cv2
 from cv2 import (
     COLOR_GRAY2RGB,
     IMREAD_GRAYSCALE,
@@ -76,7 +74,6 @@ ADJ = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 DONE_TERMINATED = 1
 DONE_TRUNCATED = 2
 
-
 @wp.struct
 class VDeriv:
     d_x: float
@@ -85,7 +82,6 @@ class VDeriv:
     d_psip: float
     d_beta: float
     d_v: float
-
 
 @wp.func
 def st_deriv(
@@ -125,7 +121,6 @@ def st_deriv(
     out.d_psip = 0.0
     out.d_beta = 0.0
     return out
-
 
 @wp.func
 def rk4_step(
@@ -196,7 +191,6 @@ def rk4_step(
         k1.d_beta + 2.0 * k2.d_beta + 2.0 * k3.d_beta + k4.d_beta
     ) * DT_SUB_SIX
     return out
-
 
 @wp.kernel
 def step_kernel(
@@ -388,7 +382,6 @@ def step_kernel(
     cars_int[i, 0] = steps
     cars_int[i, 1] = new_wp
 
-
 # Map
 class Map:
     def __init__(self, path: Path):
@@ -468,7 +461,6 @@ class Map:
         self.lut = tree.query(
             np.column_stack([rows.ravel(), cols.ravel()]), workers=-1
         )[1].reshape(rows.shape)
-
 
 # Env
 class RacingEnv:
@@ -611,7 +603,6 @@ class RacingEnv:
         self.rew_buf.copy_(s["rew_buf"])
         self.done_buf.copy_(s["done_buf"])
 
-
 # PPO components
 class RunningMeanStd:
     def __init__(self, shape, device):
@@ -636,7 +627,6 @@ class RunningMeanStd:
     def normalize(self, x, clip: float = 10.0):
         return ((x - self.mean) * self.inv_std).clamp(-clip, clip)
 
-
 class ReturnNormalizer:
     def __init__(self, num_envs, gamma, device):
         self.gamma = gamma
@@ -650,12 +640,10 @@ class ReturnNormalizer:
     def normalize(self, reward):
         return reward * self.rms.inv_std
 
-
 def layer_init(layer, std=np.sqrt(2.0), bias=0.0):
     nn.init.orthogonal_(layer.weight, std)
     nn.init.constant_(layer.bias, bias)
     return layer
-
 
 class Agent(nn.Module):
     LOGSTD_MIN, LOGSTD_MAX = -1.6, -0.3
@@ -695,7 +683,6 @@ class Agent(nn.Module):
     def deterministic(self, obs):
         return self.actor(obs)
 
-
 class KLAdaptiveLR:
     def __init__(self, opt, target_kl=0.02, factor=1.5, lr_min=1e-6, lr_max=3e-3):
         self.opt = opt
@@ -715,48 +702,6 @@ class KLAdaptiveLR:
     @property
     def lr(self):
         return self.opt.param_groups[0]["lr"]
-
-class F110Visualizer:
-    def __init__(self, env):
-        self.env = env
-        self.viewer = wp.build.Viewer(title="NewtonRacer 3D", up_axis="Z")
-        self._setup_track()
-        
-    def _setup_track(self):
-        # Generate wall mesh from occupancy grid
-        mask = (self.env.map.raw < OCC_THRESH).astype(np.uint8)
-        contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        verts, faces = [], []
-        height = 0.3
-        for cnt in contours:
-            pts = cnt.reshape(-1, 2)
-            if len(pts) < 3: continue
-            start_idx = len(verts)
-            for p in pts:
-                wx = self.env.map.ox + p[0] * self.env.map.res
-                wy = self.env.map.oy + (self.env.map.h - 1 - p[1]) * self.env.map.res
-                verts.append([wx, wy, 0.0])
-                verts.append([wx, wy, height])
-            n = len(pts)
-            for j in range(n):
-                i1, i2 = start_idx + j*2, start_idx + ((j+1)%n)*2
-                faces.append([i1, i2, i1+1])
-                faces.append([i2, i2+1, i1+1])
-        self.viewer.add_mesh("walls", np.array(verts), np.array(faces), color=(0.5, 0.5, 0.5))
-        self.viewer.add_box("floor", [0,0,-0.005], wp.quat_identity(), [50, 50, 0.005], color=(0.1, 0.1, 0.1))
-
-    def update(self, car_idx=0):
-        c = self.env.cars_buf[car_idx].cpu().numpy()
-        pos = [c[0], c[1], 0.05]
-        rot = wp.quat_from_axis_angle([0,0,1], c[4])
-        self.viewer.begin_frame()
-        self.viewer.render_box("car", pos, rot, [LENGTH/2, WIDTH/2, 0.04], color=(1, 0.3, 0.3))
-        # Traction Circle HUD (Pro-Tip)
-        hud_pos = [c[0], c[1], 0.8]
-        self.viewer.render_circle("friction_limit", hud_pos, wp.quat_identity(), 0.5, color=(1,1,1))
-        # In a real impl, we'd pass accelerations from the kernel here
-        self.viewer.set_camera_lookat([c[0]-2, c[1], 2], [c[0], c[1], 0])
-        self.viewer.end_frame()
 
 # Rollout video
 def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
@@ -816,7 +761,6 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
     finally:
         env.restore_state(snap)
         agent.train(was_training)
-
 
 # PPO training
 def train(
@@ -1011,7 +955,6 @@ def train(
                 print(f"[rollout {it + 1}] failed: {e}")
     return time.time() - t0, obs_rms, ret_rms, global_step
 
-
 def main(
     map_yaml: Path,
     num_envs: int = 4096,
@@ -1022,7 +965,6 @@ def main(
     record_every: int = 100,
     record_steps: int = 1800,
     use_wandb: bool = True,
-    interactive: bool = True,
 ):
     log_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(seed)
@@ -1035,10 +977,6 @@ def main(
     env = RacingEnv(map_yaml, num_envs=num_envs, seed=seed, device=device or None)
     agent = Agent(obs_dim=OBS_DIM).to(env.device)
 
-    if interactive:
-        renderer = warp.render.OpenGLRenderer()
-        return
-    
     if use_wandb:
         try:
             wandb.init(
@@ -1080,7 +1018,6 @@ def main(
         wandb.log({"rollout_final": wandb.Video(str(out), format="mp4")}, step=step)
     except Exception:
         pass
-
 
 if __name__ == "__main__":
     run(main)
