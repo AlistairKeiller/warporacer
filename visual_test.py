@@ -8,22 +8,44 @@ from imgui_bundle.python_backends import pyglet_backend
 import time
 
 class ImGuiManager:
-    def __init__(self, renderer):
+    # ImGUI uses Top Left origin while Pyglet is Bottom Left and you have to remember DPI scaling!
+    def __init__(self, renderer:warp.render.OpenGLRenderer):
         imgui.create_context()
         self.renderer = renderer
-        self.impl = pyglet_backend.create_renderer(self.renderer.window)
 
-        # Vibes
-        self.renderer.window.push_handlers(self.impl)
+        # Tell the backend NOT to attach its broken callbacks and override them
+        self.impl = pyglet_backend.create_renderer(self.renderer.window, attach_callbacks=False)
+        self.impl.on_mouse_motion = self.on_mouse_motion
+        self.impl.on_mouse_drag = self.on_mouse_drag
+        self.impl._attach_callbacks(self.renderer.window)
+
+        # "self.renderer.enable_keyboard_interaction = False" is not working dynamically
+        self.renderer.window.push_handlers(on_key_press=self.on_key_press)
+
+    def want_capture_mouse(self, *args, **kwargs):
+        return self.impl.io.want_capture_mouse
+
+    def on_mouse_motion(self, x, y, dx, dy):
+        ratio = self.renderer.window.get_pixel_ratio()
+        self.impl.io.add_mouse_pos_event(x / ratio, self.impl.io.display_size.y - (y / ratio))
+    
+    def on_mouse_drag(self, x, y, dx, dy, button, modifiers):
+        self.impl._on_mouse_button(button, True)
+        self.on_mouse_motion(x, y, dx, dy)
+        return self.impl.io.want_capture_mouse
+    
+    def on_key_press(self, symbol, modifiers):
+        return self.impl.io.want_capture_keyboard
 
     def render_frame(self):
         """Renders a single frame of the UI. This should be called from the main render loop."""
+        io = imgui.get_io()
+        ratio = self.renderer.window.get_pixel_ratio()
+        io.display_size = self.renderer.screen_width / ratio, self.renderer.screen_height / ratio
+
         self.impl.process_inputs()
         imgui.new_frame()
 
-        io = imgui.get_io()
-        io.display_size = self.renderer.screen_width, self.renderer.screen_height
-        
         self.draw_ui()
 
         imgui.render()
@@ -31,8 +53,8 @@ class ImGuiManager:
 
     def draw_ui(self):
         """Draws the UI"""
-        imgui.set_next_window_size(imgui.ImVec2(300, 400), imgui.Cond_.first_use_ever)
-        imgui.set_next_window_pos(imgui.ImVec2(50, 500), imgui.Cond_.first_use_ever)
+        imgui.set_next_window_size(imgui.ImVec2(640, 480), imgui.Cond_.first_use_ever)
+        imgui.set_next_window_pos(imgui.ImVec2(0, 0), imgui.Cond_.first_use_ever)
 
         imgui.begin("Warp Float Values")
 
@@ -42,6 +64,9 @@ class ImGuiManager:
         imgui.text("Editable floats:")
         imgui.separator()
         imgui.text("File Dialog Examples:")
+
+        ok = "bruh"
+        imgui.input_text("Gmaing", ok)
 
         imgui.end()
 
