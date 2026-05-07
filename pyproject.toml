@@ -8,6 +8,7 @@ dependencies = [
     "gymnasium>=1.2.3",
     "imageio[ffmpeg]>=2.37.3",
     "imgui-bundle>=1.92.700",
+    "matplotlib>=3.10.9",
     "numpy>=2.4.4",
     "opencv-python>=4.13.0.92",
     "pyglet>=2.1.14",

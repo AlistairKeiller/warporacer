@@ -370,10 +370,11 @@ from cv2 import (
     polylines,
 )
 from yaml import safe_load
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import binary_dilation, distance_transform_edt
 from scipy.signal import savgol_filter
 from scipy.spatial import KDTree
 from skimage.morphology import skeletonize
+from skimage import filters
 from collections import deque
 from pathlib import Path
 
@@ -384,12 +385,12 @@ class Map:
         self.raw = imread(str(img_path), IMREAD_GRAYSCALE)
         if self.raw is None:
             raise FileNotFoundError(img_path)
-        free = self.raw >= OCC_THRESH
-        self.dt = distance_transform_edt(free)
+        self.free = self.raw >= OCC_THRESH
+        self.dt = distance_transform_edt(self.free)
         self.ox, self.oy, _ = self.meta["origin"]
         self.h, self.w = self.raw.shape
         self.res = float(self.meta["resolution"])
-        self._compute_centerline(free)
+        self._compute_centerline()
         self._build_lut()
 
     @staticmethod
@@ -400,8 +401,8 @@ class Map:
             if 0 <= r + dr < h and 0 <= c + dc < w and skel[r + dr, c + dc]
         ]
 
-    def _compute_centerline(self, free):
-        skel = skeletonize(free)
+    def _compute_centerline(self):
+        skel = skeletonize(self.free)
         h, w = skel.shape
         pts = np.argwhere(skel)
         origin_px = np.array([self.h - 1 + self.oy / self.res, -self.ox / self.res])
@@ -535,10 +536,12 @@ class Visuals:
     
         # Init Warp Render
         self.renderer = warp.render.OpenGLRenderer(
-            fps=60,
             screen_width=1280,
             screen_height=720,
+            near_plane=0.1,
+            far_plane=1000,
             up_axis="Z", # Cannot change sun direction because it's hard coded in! Cringe!
+            draw_grid=False,
             device=wp.get_device()
         )
 
@@ -546,10 +549,88 @@ class Visuals:
         self.imgui_manager = ImGuiManager(self.renderer)
         self.renderer.render_2d_callbacks.append(self.imgui_manager.render_frame)
 
+        # Initialize environment
+        self.init_environment()
+
         # Setup rendering loop
-        pyglet.clock.schedule_interval(self.pyglet_draw, self.renderer._frame_dt)
-        pyglet.app.run()
+        while self.renderer.is_running():
+            self.render()
+
         self.clear()
+
+    def init_environment(self):
+        self.map = Map(Path(".\\maps\\my_map.yaml"))
+
+        self.setup_map_grid()
+        self.setup_map_walls()
+        self.setup_map_center_line()
+
+    def setup_map_grid(self):
+        pixel_size = self.map.res 
+        half_pixel = pixel_size / 2.0  # The shift amount
+        
+        w = self.map.w
+        h = self.map.h
+        ox = self.map.ox
+        oy = self.map.oy
+        z_height = 0.0
+
+        # Vertical lines
+        # Shift all X coordinates back by half a pixel
+        x_coords = ox + (np.arange(w + 1) * pixel_size) - half_pixel
+        
+        v_starts = np.column_stack([x_coords, np.full_like(x_coords, oy - half_pixel), np.full_like(x_coords, z_height)])
+        v_ends = np.column_stack([x_coords, np.full_like(x_coords, oy + (h * pixel_size) - half_pixel), np.full_like(x_coords, z_height)])
+        
+        v_verts = np.empty((2 * (w + 1), 3), dtype=np.float32)
+        v_verts[0::2] = v_starts
+        v_verts[1::2] = v_ends
+
+        # Horizontal lines
+        # Shift all Y coordinates back by half a pixel
+        y_coords = oy + (np.arange(h + 1) * pixel_size) - half_pixel
+        
+        h_starts = np.column_stack([np.full_like(y_coords, ox - half_pixel), y_coords, np.full_like(y_coords, z_height)])
+        h_ends = np.column_stack([np.full_like(y_coords, ox + (w * pixel_size) - half_pixel), y_coords, np.full_like(y_coords, z_height)])
+        
+        h_verts = np.empty((2 * (h + 1), 3), dtype=np.float32)
+        h_verts[0::2] = h_starts
+        h_verts[1::2] = h_ends
+
+        # Combine them
+        self.grid_vertices = np.vstack([v_verts, h_verts])
+        self.grid_indices = np.arange(len(self.grid_vertices), dtype=np.int32)
+    
+    def setup_map_walls(self):
+        dilated_free = binary_dilation(self.map.free)
+
+        # The 1-pixel wall boundary is where the space is dilated, 
+        # but was NOT part of the original free track.
+        boundary_mask = dilated_free & ~self.map.free 
+
+        # Extract the exact row/col coordinates of just that 1-pixel line
+        boundary_pixels = np.argwhere(boundary_mask)
+
+        rows = boundary_pixels[:, 0]
+        cols = boundary_pixels[:, 1]
+
+        # Convert to physical world coordinates
+        wall_x = self.map.ox + cols * self.map.res
+        wall_y = self.map.oy + (self.map.h - 1 - rows) * self.map.res
+
+        # Build the 3D vertex array for Warp
+        num_wall_points = len(boundary_pixels)
+        self.wall_vertices = np.zeros((num_wall_points, 3), dtype=np.float32)
+        self.wall_vertices[:, 0] = wall_x
+        self.wall_vertices[:, 1] = wall_y
+        self.wall_vertices[:, 2] = 0.02 # Float slightly above the ground
+
+    def setup_map_center_line(self):
+        num_points = len(self.map.centerline)
+        self.track_vertices = np.zeros((num_points, 3), dtype=np.float32)
+        self.track_vertices[:, 0] = self.map.centerline[:, 0]
+        self.track_vertices[:, 1] = self.map.centerline[:, 1]
+        self.track_vertices[:, 2] = 0.02 
 
     def pyglet_draw(self, dt):
         self.render()
@@ -560,20 +641,57 @@ class Visuals:
         self.renderer.begin_frame(time)
 
         # Begin Render
-        # Example shapes
-        self.renderer.render_cylinder(
-            "cylinder",
-            [3.2, 1.0, np.sin(time + 0.5)],
-            np.array(wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), wp.sin(time + 0.5))),
-            radius=0.5,
-            half_height=0.8,
+        physical_width = self.map.w * self.map.res
+        physical_length = self.map.h * self.map.res
+
+        center_x = self.map.ox + (physical_width / 2.0)
+        center_y = self.map.oy + (physical_length / 2.0)
+        self.renderer.render_plane(
+            name="map_ground",
+            pos=[center_x, center_y, 0.0],
+            rot=np.array(wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), np.pi / 2.0)),
+            width=physical_width / 2.0,
+            length=physical_length / 2.0,
+            color=(0.15, 0.15, 0.15) # Dark gray looks great under a grid
         )
-        self.renderer.render_cone(
-            "cone",
-            [-1.2, 1.0, 0.0],
-            np.array(wp.quat_from_axis_angle(wp.vec3(0.707, 0.707, 0.0), time)),
-            radius=0.5,
-            half_height=0.8,
+
+        # Pixel Grid
+        self.renderer.render_line_list(
+            name="pixel_grid",
+            vertices=self.grid_vertices,
+            indices=self.grid_indices,
+            color=(0, 0, 0),
+            radius=0.005
+        )
+
+        # Walls
+        self.renderer.render_points(
+            name="physics_walls",
+            points=self.wall_vertices,
+            colors=(1.0, 0.0, 0.0),
+            radius=0.05
+        )
+
+        # Center line
+        self.renderer.render_points(
+            name="center_line",
+            points=self.track_vertices,
+            colors=(0.0, 1.0, 0.0),
+            radius=0.05
+        )
+
+        # Car
+        #car_state = self.env.cars_buf[0].cpu().numpy()
+        car_x, car_y, car_psi = 0, 0, 0 #car_state[0], car_state[1], car_state[4]
+
+        car_rot = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(car_psi))
+
+        self.renderer.render_box(
+            name="car_0",
+            pos=[car_x, car_y, 0.04], 
+            rot=np.array(car_rot),
+            extents=[LENGTH / 2.0, WIDTH / 2.0, 0.04],
+            color=(1.0, 0.2, 0.2) 
         )
         # End Render
 
