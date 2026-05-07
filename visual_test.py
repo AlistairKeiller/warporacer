@@ -65,8 +65,8 @@ class ImGuiManager:
         imgui.separator()
         imgui.text("File Dialog Examples:")
 
-        ok = "bruh"
-        imgui.input_text("Gmaing", ok)
+        static_text = "Hello, World!"
+        imgui.input_text("What does the fox say?", static_text)
 
         imgui.end()
 
@@ -81,17 +81,29 @@ class Visuals:
     # the Python executable and set to "High Performance" in Windows Graphics settings.
 
     def __init__(self):
+        print(f"Warp Device: {wp.get_device().name}")
+        print(f"Pyglet Device: {pyglet.gl.gl_info.get_renderer()}")
+    
         # Init Warp Render
         self.renderer = warp.render.OpenGLRenderer(
+            fps=60,
             screen_width=1280,
             screen_height=720,
-            device="cuda"
+            up_axis="Z", # Cannot change sun direction because it's hard coded in! Cringe!
+            device=wp.get_device()
         )
-        self.renderer.render_ground()
 
         # Init ImGUI
         self.imgui_manager = ImGuiManager(self.renderer)
         self.renderer.render_2d_callbacks.append(self.imgui_manager.render_frame)
+
+        # Setup rendering loop
+        pyglet.clock.schedule_interval(self.pyglet_draw, self.renderer._frame_dt)
+        pyglet.app.run()
+        self.clear()
+
+    def pyglet_draw(self, dt):
+        self.render()
 
     def render(self):
         # Warp Render Begin
@@ -99,6 +111,7 @@ class Visuals:
         self.renderer.begin_frame(time)
 
         # Begin Render
+        # Example shapes
         self.renderer.render_cylinder(
             "cylinder",
             [3.2, 1.0, np.sin(time + 0.5)],
@@ -124,16 +137,4 @@ class Visuals:
 
 if __name__ == "__main__":
     with wp.ScopedDevice("cuda"):
-        # Make sure these are on the same device!
-        print(f"Warp Device: {wp.get_device().name}")
-        print(f"Pyglet Device: {pyglet.gl.gl_info.get_renderer()}")
-
         vs = Visuals()
-
-        def draw(dt):
-            vs.render()
-
-        pyglet.clock.schedule_interval(draw, 1 / 60.0)
-        pyglet.app.run()
-
-        vs.clear()
