@@ -2,6 +2,7 @@ import numpy as np
 import warp as wp
 import warp.render
 import pyglet
+import torch
 from imgui_bundle import imgui
 from imgui_bundle.python_backends import pyglet_backend
 
@@ -210,6 +211,9 @@ def step_kernel(
     mh_f = wp.float32(mh) - 1.0
 
     # Input
+    actions[i][0] = 0.1 # Hard coded for testing remove later
+    actions[i][1] = 1.0
+    
     steer_v = wp.clamp(actions[i][0], -1.0, 1.0) * STEER_V_MAX
     if (steer_v < 0.0 and delta <= STEER_MIN) or (steer_v > 0.0 and delta >= STEER_MAX):
         steer_v = 0.0
@@ -362,34 +366,33 @@ def step_kernel(
     cars_int[i, 1] = new_wp
 
 from cv2 import (
-    COLOR_GRAY2RGB,
     IMREAD_GRAYSCALE,
-    cvtColor,
-    fillPoly,
-    imread,
-    polylines,
+    imread
 )
 from yaml import safe_load
 from scipy.ndimage import binary_dilation, distance_transform_edt
 from scipy.signal import savgol_filter
 from scipy.spatial import KDTree
 from skimage.morphology import skeletonize
-from skimage import filters
 from collections import deque
 from pathlib import Path
 
 class Map:
     def __init__(self, path: Path):
         self.meta = safe_load(path.read_text())
-        img_path = path.parent / self.meta["image"]
-        self.raw = imread(str(img_path), IMREAD_GRAYSCALE)
+        self.img_path = path.parent / self.meta["image"]
+
+        self.raw = imread(str(self.img_path), IMREAD_GRAYSCALE)
         if self.raw is None:
-            raise FileNotFoundError(img_path)
+            raise FileNotFoundError(self.img_path)
+        
         self.free = self.raw >= OCC_THRESH
         self.dt = distance_transform_edt(self.free)
+
         self.ox, self.oy, _ = self.meta["origin"]
         self.h, self.w = self.raw.shape
         self.res = float(self.meta["resolution"])
+
         self._compute_centerline()
         self._build_lut()
 
@@ -410,6 +413,7 @@ class Map:
         nbrs = self._neighbors(skel, start[0], start[1], h, w)
         if len(nbrs) < 2:
             raise RuntimeError(f"Skeleton seed {start} has {len(nbrs)} neighbours")
+        
         src, target = nbrs[0], nbrs[1]
         parent = {src: src}
         q = deque([src])
@@ -424,13 +428,16 @@ class Map:
                     q.clear()
                     break
                 q.append(n)
+
         path = [start]
         n = target
         while n != src:
             path.append(n)
             n = parent[n]
+
         path.append(src)
         path.reverse()
+
         rc = np.array(path)
         world = np.column_stack(
             [
@@ -438,6 +445,7 @@ class Map:
                 self.oy + (self.h - 1 - rc[:, 0]) * self.res,
             ]
         )
+
         self.centerline = savgol_filter(world, SMOOTH_WINDOW, 3, axis=0, mode="wrap")
         diffs = np.diff(self.centerline, axis=0, append=self.centerline[:1])
         self.angles = np.arctan2(diffs[:, 1], diffs[:, 0])
@@ -451,6 +459,7 @@ class Map:
                 (self.centerline[:, 0] - self.ox) / self.res,
             ]
         )
+        
         tree = KDTree(cl_px)
         rows, cols = np.mgrid[: self.h, : self.w]
         self.lut = tree.query(
@@ -530,11 +539,13 @@ class Visuals:
     # Then you have to make sure ALL aspects of the Python program is running on GPU. On Windows you find
     # the Python executable and set to "High Performance" in Windows Graphics settings.
 
-    def __init__(self):
-        print(f"Warp Device: {wp.get_device().name}")
-        print(f"Pyglet Device: {pyglet.gl.gl_info.get_renderer()}")
+    def __init__(self, env: Environment, map: Map):
+        self.env = env
+        self.map = map
     
         # Init Warp Render
+        print(f"Warp Device: {wp.get_device().name}")
+        print(f"Pyglet Device: {pyglet.gl.gl_info.get_renderer()}")
         self.renderer = warp.render.OpenGLRenderer(
             screen_width=1280,
             screen_height=720,
@@ -549,18 +560,18 @@ class Visuals:
         self.imgui_manager = ImGuiManager(self.renderer)
         self.renderer.render_2d_callbacks.append(self.imgui_manager.render_frame)
 
-        # Initialize environment
-        self.init_environment()
+        # Initialize map
+        self.setup_map()
 
-        # Setup rendering loop
+    def render_loop(self):
+        """While loop for rendering, must be last!"""
         while self.renderer.is_running():
+            self.env.step(None)
             self.render()
 
         self.clear()
 
-    def init_environment(self):
-        self.map = Map(Path(".\\maps\\my_map.yaml"))
-
+    def setup_map(self):
         self.setup_map_grid()
         self.setup_map_walls()
         self.setup_map_center_line()
@@ -630,7 +641,7 @@ class Visuals:
         self.track_vertices = np.zeros((num_points, 3), dtype=np.float32)
         self.track_vertices[:, 0] = self.map.centerline[:, 0]
         self.track_vertices[:, 1] = self.map.centerline[:, 1]
-        self.track_vertices[:, 2] = 0.02 
+        self.track_vertices[:, 2] = 0.02
 
     def pyglet_draw(self, dt):
         self.render()
@@ -681,16 +692,16 @@ class Visuals:
         )
 
         # Car
-        #car_state = self.env.cars_buf[0].cpu().numpy()
-        car_x, car_y, car_psi = 0, 0, 0 #car_state[0], car_state[1], car_state[4]
+        car_state = self.env.cars_buf[0].cpu().numpy()
+        car_x, car_y, car_psi = car_state[0], car_state[1], car_state[4]
 
         car_rot = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(car_psi))
 
         self.renderer.render_box(
             name="car_0",
-            pos=[car_x, car_y, 0.04], 
+            pos=[car_x, car_y, 0.15], 
             rot=np.array(car_rot),
-            extents=[LENGTH / 2.0, WIDTH / 2.0, 0.04],
+            extents=[LENGTH / 2.0, WIDTH / 2.0, 0.1],
             color=(1.0, 0.2, 0.2) 
         )
         # End Render
@@ -702,6 +713,133 @@ class Visuals:
         self.imgui_manager.shutdown()
         self.renderer.clear()
 
+class Environment:
+    def __init__(self,
+                 map_path: Path = Path(".\\maps\\berlin.yaml"),
+                 num_envs: int = 1,
+                 seed: int = 0
+        ):
+        self.map_path = map_path
+        self.num_envs = num_envs
+        self.seed = seed
+        self.seed_base = seed # Why two versions?
+
+        self.device = wp.get_device()
+        self.map = Map(self.map_path)
+        self.vs = Visuals(self, self.map)
+
+        self.init_cars()
+
+        self.vs.render_loop()
+
+    def init_cars(self):
+        self.look_step = self.map.look_step
+        d = self.device
+
+        self.dt_buf = wp.array(self.map.dt.T.astype(np.float32), dtype=float, device=d)
+        self.lut_buf = wp.array(self.map.lut.T.astype(np.int32), dtype=int, device=d)
+        self.centerline_buf = wp.array(
+            np.column_stack([self.map.centerline, self.map.angles]).astype(np.float32),
+            dtype=wp.vec3,
+            device=d,
+        )
+        self.n_cl = len(self.map.centerline)
+
+        rng = np.random.default_rng(self.seed)
+        idxs = rng.integers(0, self.n_cl, size=self.num_envs)
+        cars = np.zeros((self.num_envs, 7), dtype=np.float32)
+        cars[:, 0] = self.map.centerline[idxs, 0]
+        cars[:, 1] = self.map.centerline[idxs, 1]
+        cars[:, 4] = self.map.angles[idxs]
+        cars_int = np.zeros((self.num_envs, 2), dtype=np.int32)
+        cars_int[:, 1] = idxs
+        dr_init = (
+            1.0 - DR_FRAC + 2.0 * DR_FRAC * rng.random((self.num_envs, 4), dtype=np.float32)
+        )
+
+        self.cars = wp.array(cars, dtype=float, device=d)
+        self.cars_int = wp.array(cars_int, dtype=int, device=d)
+        self.car_dr = wp.array(dr_init, dtype=float, device=d)
+        self.obs = wp.zeros((self.num_envs, OBS_DIM), dtype=float, device=d)
+        self.rew = wp.zeros(self.num_envs, dtype=float, device=d)
+        self.done = wp.zeros(self.num_envs, dtype=int, device=d)
+
+        self.obs_buf = wp.to_torch(self.obs)
+        self.rew_buf = wp.to_torch(self.rew)
+        self.done_buf = wp.to_torch(self.done)
+        self.cars_buf = wp.to_torch(self.cars)
+        self.cars_int_buf = wp.to_torch(self.cars_int)
+        self._step_counter = self.cars_int_buf[:, 0]
+
+        angles = np.linspace(-LIDAR_FOV / 2, LIDAR_FOV / 2, NUM_LIDAR, dtype=np.float32)
+        self.lidar_buf = wp.array(
+            np.column_stack([np.cos(angles), np.sin(angles)]),
+            dtype=wp.vec2,
+            device=d,
+        )
+        self._zero_act = wp.zeros(self.num_envs, dtype=wp.vec2, device=d)
+        self._call = 0
+
+        # Warm-up reset
+        self._launch(self._zero_act)
+        self._sanitize()
+        self._step_counter.zero_()
+        self.rew_buf.zero_()
+        self.done_buf.zero_()
+
+    def _launch(self, act):
+        seed = (self.seed_base * 2654435761 + self._call * 83492791) & 0x7FFFFFFF
+        wp.launch(
+            step_kernel,
+            dim=self.num_envs,
+            inputs=[
+                act,
+                self.obs,
+                self.rew,
+                self.done,
+                self.cars,
+                self.cars_int,
+                self.car_dr,
+                wp.vec2(self.map.ox, self.map.oy),
+                self.map.res,
+                self.dt_buf,
+                self.lut_buf,
+                self.centerline_buf,
+                self.n_cl,
+                self.look_step,
+                self.lidar_buf,
+                int(seed),
+            ],
+        )
+        wp.synchronize_device(self.cars.device)
+        self._call += 1
+
+    def step(self, action):
+        #self._launch(wp.from_torch(action.detach().contiguous(), dtype=wp.vec2))
+        self._launch(self._zero_act)
+        self._sanitize()
+        return (
+            self.obs_buf,
+            self.rew_buf,
+            self.done_buf == DONE_TERMINATED,
+            self.done_buf == DONE_TRUNCATED,
+            {},
+        )
+    
+    def _sanitize(self):
+        bad = ~(
+            torch.isfinite(self.obs_buf).all(1) & torch.isfinite(self.cars_buf).all(1)
+        )
+        if not bad.any():
+            return
+        
+        torch.nan_to_num_(self.obs_buf, nan=0.0, posinf=LIDAR_RANGE, neginf=0.0)
+        torch.nan_to_num_(self.cars_buf, nan=0.0, posinf=0.0, neginf=0.0)
+        torch.nan_to_num_(self.rew_buf, nan=0.0, posinf=0.0, neginf=0.0)
+
+        self._step_counter[bad] = MAX_STEPS
+        self.done_buf[bad] = DONE_TRUNCATED
+
 if __name__ == "__main__":
     with wp.ScopedDevice("cuda"):
-        vs = Visuals()
+        env = Environment()
