@@ -174,21 +174,21 @@ def rk4_step(
 
 @wp.kernel
 def step_kernel(
-    actions: wp.array(dtype=wp.vec2),
-    obs: wp.array2d(dtype=wp.float32),
-    reward: wp.array(dtype=wp.float32),
-    done: wp.array(dtype=wp.int32),
-    cars: wp.array2d(dtype=wp.float32),
-    cars_int: wp.array2d(dtype=wp.int32),
-    car_dr: wp.array2d(dtype=wp.float32),
+    actions: wp.array[wp.vec2],
+    obs: wp.array2d[wp.float32],
+    reward: wp.array[wp.float32],
+    done: wp.array[wp.int32],
+    cars: wp.array2d[wp.float32],
+    cars_int: wp.array2d[wp.int32],
+    car_dr: wp.array2d[wp.float32],
     origin: wp.vec2,
     res: float,
-    dt_map: wp.array2d(dtype=wp.float32),
-    cl_lut: wp.array2d(dtype=wp.int32),
-    centerline: wp.array(dtype=wp.vec3),
+    dt_map: wp.array2d[wp.float32],
+    cl_lut: wp.array2d[wp.int32],
+    centerline: wp.array[wp.vec3],
     n_cl: int,
     look_step: int,
-    lidar_dirs: wp.array(dtype=wp.vec2),
+    lidar_dirs: wp.array[wp.vec2],
     seed_base: int,
 ):
     i = wp.tid()
@@ -468,9 +468,10 @@ class Map:
 
 class ImGuiManager:
     # ImGUI uses Top Left origin while Pyglet is Bottom Left and you have to remember DPI scaling!
-    def __init__(self, renderer:warp.render.OpenGLRenderer):
+    def __init__(self, renderer: warp.render.OpenGLRenderer, env: Environment):
         imgui.create_context()
         self.renderer = renderer
+        self.env = env
 
         # Tell the backend NOT to attach its broken callbacks and override them
         self.impl = pyglet_backend.create_renderer(self.renderer.window, attach_callbacks=False)
@@ -479,10 +480,7 @@ class ImGuiManager:
         self.impl._attach_callbacks(self.renderer.window)
 
         # "self.renderer.enable_keyboard_interaction = False" is not working dynamically
-        self.renderer.window.push_handlers(on_key_press=self.on_key_press)
-
-    def want_capture_mouse(self, *args, **kwargs):
-        return self.impl.io.want_capture_mouse
+        self.renderer.window.push_handlers(on_key_press=self._on_key_press)
 
     def on_mouse_motion(self, x, y, dx, dy):
         ratio = self.renderer.window.get_pixel_ratio()
@@ -493,10 +491,10 @@ class ImGuiManager:
         self.on_mouse_motion(x, y, dx, dy)
         return self.impl.io.want_capture_mouse
     
-    def on_key_press(self, symbol, modifiers):
+    def _on_key_press(self, symbol, modifiers):
         return self.impl.io.want_capture_keyboard
 
-    def render_frame(self):
+    def _render_frame(self):
         """Renders a single frame of the UI. This should be called from the main render loop."""
         io = imgui.get_io()
         ratio = self.renderer.window.get_pixel_ratio()
@@ -505,27 +503,26 @@ class ImGuiManager:
         self.impl.process_inputs()
         imgui.new_frame()
 
-        self.draw_ui()
+        self._draw_ui()
 
         imgui.render()
         self.impl.render(imgui.get_draw_data())
 
-    def draw_ui(self):
+    def _draw_ui(self):
         """Draws the UI"""
-        imgui.set_next_window_size(imgui.ImVec2(640, 480), imgui.Cond_.first_use_ever)
-        imgui.set_next_window_pos(imgui.ImVec2(0, 0), imgui.Cond_.first_use_ever)
+        io = imgui.get_io()
+        imgui.set_next_window_pos(imgui.ImVec2(150, 0), imgui.Cond_.first_use_ever)
 
-        imgui.begin("Warp Float Values")
-
-        imgui.text(f"A read-only float: {self.renderer.clock_time}")
+        imgui.begin("Environment Data")
+        imgui.text(f"Number of environments: {self.env.num_envs}")
         imgui.separator()
+        if imgui.begin_list_box("carbox"):
+            for i in range(self.env.num_envs):
+                car_state = self.env.cars_buf[i].cpu().numpy()
+                car_x, car_y, car_psi = car_state[0], car_state[1], car_state[4]
+                imgui.text(f"car_{i}@({car_x:.2f}, {car_y:.2f}), yaw=({car_psi:.2f})")
 
-        imgui.text("Editable floats:")
-        imgui.separator()
-        imgui.text("File Dialog Examples:")
-
-        static_text = "Hello, World!"
-        imgui.input_text("What does the fox say?", static_text)
+            imgui.end_list_box()
 
         imgui.end()
 
@@ -547,36 +544,46 @@ class Visuals:
         print(f"Warp Device: {wp.get_device().name}")
         print(f"Pyglet Device: {pyglet.gl.gl_info.get_renderer()}")
         self.renderer = warp.render.OpenGLRenderer(
+            title="Warp from Thaumcraft",
             screen_width=1280,
             screen_height=720,
             near_plane=0.1,
             far_plane=1000,
             up_axis="Z", # Cannot change sun direction because it's hard coded in! Cringe!
             draw_grid=False,
+            draw_axis=False,
             device=wp.get_device()
         )
 
         # Init ImGUI
-        self.imgui_manager = ImGuiManager(self.renderer)
-        self.renderer.render_2d_callbacks.append(self.imgui_manager.render_frame)
+        self.imgui_manager = ImGuiManager(self.renderer, env)
+        self.renderer.render_2d_callbacks.append(self.imgui_manager._render_frame)
 
         # Initialize map
-        self.setup_map()
+        self._setup_map()
 
     def render_loop(self):
         """While loop for rendering, must be last!"""
+
+        import time
+
+        last_render_time = time.perf_counter()
         while self.renderer.is_running():
             self.env.step(None)
-            self.render()
 
-        self.clear()
+            current_time = time.perf_counter()
+            if current_time - last_render_time >= (1.0 / 60.0):
+                last_render_time = current_time
+                self._render()
 
-    def setup_map(self):
-        self.setup_map_grid()
-        self.setup_map_walls()
-        self.setup_map_center_line()
+        self._clear()
 
-    def setup_map_grid(self):
+    def _setup_map(self):
+        self._setup_map_grid()
+        self._setup_map_walls()
+        self._setup_map_center_line()
+
+    def _setup_map_grid(self):
         pixel_size = self.map.res 
         half_pixel = pixel_size / 2.0  # The shift amount
         
@@ -612,7 +619,7 @@ class Visuals:
         self.grid_vertices = np.vstack([v_verts, h_verts])
         self.grid_indices = np.arange(len(self.grid_vertices), dtype=np.int32)
     
-    def setup_map_walls(self):
+    def _setup_map_walls(self):
         dilated_free = binary_dilation(self.map.free)
 
         # The 1-pixel wall boundary is where the space is dilated, 
@@ -636,17 +643,14 @@ class Visuals:
         self.wall_vertices[:, 1] = wall_y
         self.wall_vertices[:, 2] = 0.02 # Float slightly above the ground
 
-    def setup_map_center_line(self):
+    def _setup_map_center_line(self):
         num_points = len(self.map.centerline)
         self.track_vertices = np.zeros((num_points, 3), dtype=np.float32)
         self.track_vertices[:, 0] = self.map.centerline[:, 0]
         self.track_vertices[:, 1] = self.map.centerline[:, 1]
         self.track_vertices[:, 2] = 0.02
 
-    def pyglet_draw(self, dt):
-        self.render()
-
-    def render(self):
+    def _render(self):
         # Warp Render Begin
         time = self.renderer.clock_time
         self.renderer.begin_frame(time)
@@ -692,24 +696,26 @@ class Visuals:
         )
 
         # Car
-        car_state = self.env.cars_buf[0].cpu().numpy()
-        car_x, car_y, car_psi = car_state[0], car_state[1], car_state[4]
+        for i in range(self.env.num_envs):
+            percent = float(i) / float(self.env.num_envs)
+            car_state = self.env.cars_buf[i].cpu().numpy()
+            car_x, car_y, car_psi = car_state[0], car_state[1], car_state[4]
 
-        car_rot = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(car_psi))
+            car_rot = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(car_psi))
 
-        self.renderer.render_box(
-            name="car_0",
-            pos=[car_x, car_y, 0.15], 
-            rot=np.array(car_rot),
-            extents=[LENGTH / 2.0, WIDTH / 2.0, 0.1],
-            color=(1.0, 0.2, 0.2) 
-        )
+            self.renderer.render_box(
+                name=f"car_{i}",
+                pos=[car_x, car_y, 0.15], 
+                rot=np.array(car_rot),
+                extents=[LENGTH / 2.0, WIDTH / 2.0, 0.1],
+                color=(1.0 - percent, 0.0, percent) 
+            )
         # End Render
 
         # Warp Render End
         self.renderer.end_frame()
 
-    def clear(self):
+    def _clear(self):
         self.imgui_manager.shutdown()
         self.renderer.clear()
 
@@ -726,13 +732,13 @@ class Environment:
 
         self.device = wp.get_device()
         self.map = Map(self.map_path)
+
+        self._init_cars()
+
         self.vs = Visuals(self, self.map)
-
-        self.init_cars()
-
         self.vs.render_loop()
 
-    def init_cars(self):
+    def _init_cars(self):
         self.look_step = self.map.look_step
         d = self.device
 
@@ -787,6 +793,18 @@ class Environment:
         self.rew_buf.zero_()
         self.done_buf.zero_()
 
+    def step(self, action):
+        #self._launch(wp.from_torch(action.detach().contiguous(), dtype=wp.vec2))
+        self._launch(self._zero_act)
+        self._sanitize()
+        return (
+            self.obs_buf,
+            self.rew_buf,
+            self.done_buf == DONE_TERMINATED,
+            self.done_buf == DONE_TRUNCATED,
+            {},
+        )
+
     def _launch(self, act):
         seed = (self.seed_base * 2654435761 + self._call * 83492791) & 0x7FFFFFFF
         wp.launch(
@@ -813,18 +831,6 @@ class Environment:
         )
         wp.synchronize_device(self.cars.device)
         self._call += 1
-
-    def step(self, action):
-        #self._launch(wp.from_torch(action.detach().contiguous(), dtype=wp.vec2))
-        self._launch(self._zero_act)
-        self._sanitize()
-        return (
-            self.obs_buf,
-            self.rew_buf,
-            self.done_buf == DONE_TERMINATED,
-            self.done_buf == DONE_TRUNCATED,
-            {},
-        )
     
     def _sanitize(self):
         bad = ~(
@@ -842,4 +848,4 @@ class Environment:
 
 if __name__ == "__main__":
     with wp.ScopedDevice("cuda"):
-        env = Environment()
+        env = Environment(num_envs=128)

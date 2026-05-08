@@ -12,3 +12,4 @@ wheels/
 logs/
 wandb/
 *.log
+imgui.ini
