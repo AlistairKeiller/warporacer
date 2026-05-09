@@ -1,3 +1,4 @@
+import time
 from typing import TYPE_CHECKING # Forward declaration
 
 import numpy as np
@@ -5,6 +6,7 @@ import pyglet
 import warp as wp
 import warp.render  # Must include for OpenGLRenderer
 from scipy.ndimage import binary_dilation
+from pyglet.window import key
 
 from include.constants import *
 from include.imgui_manager import ImGuiManager
@@ -12,8 +14,6 @@ from include.map import Map
 
 if TYPE_CHECKING:
     from include.environment import Environment
-
-RENDER_FPS = 600.0
 
 class Visuals:
     def __init__(self, env: Environment, map: Map):
@@ -23,7 +23,7 @@ class Visuals:
         # Init Warp Render
         print(f"Warp Device: {wp.get_device().name}")
         print(f"Pyglet Device: {pyglet.gl.gl_info.get_renderer()}")
-        self.renderer = wp.render.OpenGLRenderer(
+        self.renderer = warp.render.OpenGLRenderer( # Changed from wp to warp for VSCode
             title="Warp from Thaumcraft",
             screen_width=1280,
             screen_height=720,
@@ -39,24 +39,39 @@ class Visuals:
         self.imgui_manager = ImGuiManager(self.renderer, env)
         self.renderer.render_2d_callbacks.append(self.imgui_manager._render_frame)
 
+        # Initialize keyboard controls
+        self.key_handler = key.KeyStateHandler()
+        self.renderer.window.push_handlers(self.key_handler)
+
         # Initialize map
         self.initialized_all_agents = False
         self._setup_map()
         self._setup_static_objects()
         self._setup_dynamic_objects()
 
-    def render_loop(self):
+    def interactive_render_loop(self):
         """While loop for rendering, must be last!"""
 
-        import time
+        import torch
+        user_actions = torch.zeros((self.env.num_envs, ACT_DIM), device=str(self.env.device))
 
-        last_render_time = time.perf_counter()
+        self.last_render_time = time.perf_counter()
         while self.renderer.is_running():
-            self.env.step(None)
-
             current_time = time.perf_counter()
-            if current_time - last_render_time >= (1.0 / RENDER_FPS):
-                last_render_time = current_time
+            if current_time - self.last_render_time >= DT:
+                self.last_render_time = current_time
+                # Take user inputs
+
+                # I = Forward (+1.0), K = Backward/Brake (-1.0)
+                throttle = float(self.key_handler[key.I] - self.key_handler[key.K])
+                
+                # J = Left (+1.0), L = Right (-1.0) 
+                steering = float(self.key_handler[key.J] - self.key_handler[key.L])
+
+                # Process inputs and display result
+                user_actions[0, 0] = steering
+                user_actions[0, 1] = throttle
+                self.env.step(user_actions)
                 self._render()
 
         self._clear()
@@ -246,10 +261,57 @@ class Visuals:
             pos=[car_x, car_y, 0.15], 
             rot=np.array(car_rot)
         )
+        self.render_lidar_old()
         # End Render
 
         # Warp Render End
         self.renderer.end_frame()
+
+    def render_lidar(self):
+        pass
+
+    def render_lidar_old(self):
+        # Pull data from GPU to CPU
+        obs = self.env.obs_buf.cpu().numpy()[0]
+        car_state = self.env.cars_buf.cpu().numpy()[0]
+        lidar_dirs = self.env.lidar_buf.numpy()  
+        
+        # Extract Car 0's State
+        car_x = car_state[0]
+        car_y = car_state[1]
+        car_psi = car_state[4] 
+        
+        # Calculate true LiDAR origin
+        lx = car_x + LF * np.cos(car_psi)
+        ly = car_y + LF * np.sin(car_psi)
+        
+        # Extract distances (Starts at index 3, and spans exactly num_rays)
+        num_rays = len(lidar_dirs)
+        distances = obs[3 : 3 + num_rays]
+        
+        # Extract local angles directly from your lidar_buf
+        # lidar_dirs[:, 0] is cos(angle), lidar_dirs[:, 1] is sin(angle)
+        local_angles = np.arctan2(lidar_dirs[:, 1], lidar_dirs[:, 0])
+        
+        # Calculate global angle for Car 0's rays
+        global_angles = car_psi + local_angles
+        
+        # Trigonometry to find X, Y hit points
+        hit_xs = lx + distances * np.cos(global_angles)
+        hit_ys = ly + distances * np.sin(global_angles)
+        
+        # Set Z height slightly above ground
+        hit_zs = np.full_like(hit_xs, 0.1) 
+        
+        # Stack into a list of 3D coordinates: [[x,y,z], [x,y,z]...]
+        points_3d = np.stack([hit_xs, hit_ys, hit_zs], axis=-1)
+        
+        self.renderer.render_points(
+            name="lidar_cloud_car_0", 
+            points=points_3d,
+            radius=0.05,               
+            colors=(0.0, 1.0, 1.0)
+        )
 
     def _clear(self):
         self.imgui_manager.shutdown()

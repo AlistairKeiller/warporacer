@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import torch
+import numpy as np
 import warp as wp
 from typer import run
 
@@ -22,15 +24,30 @@ def main(
     use_wandb: bool = True,
     log_dir: Path = Path("./logs"),
 ):
+    if interactive:
+        num_envs = 1
+
     if not device:
         device = wp.get_device()
 
-    if interactive:
-        with wp.ScopedDevice(device):
-            env = Environment(map_yaml, num_envs, seed)
-    else:
-        print("TODO")
-        pass
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.benchmark = True
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    with wp.ScopedDevice(device):
+        env = Environment(map_yaml, num_envs, seed)
+
+        if interactive:
+            env.vs.interactive_render_loop()
+        else:
+            print("TODO")
+            pass
 
 if __name__ == "__main__":
-    run(main)
+    #run(main)
+    main()

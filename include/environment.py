@@ -27,7 +27,6 @@ class Environment:
         self._init_cars()
 
         self.vs = Visuals(self, self.map)
-        self.vs.render_loop()
 
     def _init_cars(self):
         self.look_step = self.map.look_step
@@ -85,8 +84,7 @@ class Environment:
         self.done_buf.zero_()
 
     def step(self, action):
-        #self._launch(wp.from_torch(action.detach().contiguous(), dtype=wp.vec2))
-        self._launch(self._zero_act)
+        self._launch(wp.from_torch(action.detach().contiguous(), dtype=wp.vec2))
         self._sanitize()
         return (
             self.obs_buf,

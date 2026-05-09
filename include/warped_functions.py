@@ -159,8 +159,6 @@ def step_kernel(
     mh_f = wp.float32(mh) - 1.0
 
     # Input
-    actions[i][0] = 0.1 # Hard coded for testing remove later
-    actions[i][1] = 1.0
     
     steer_v = wp.clamp(actions[i][0], -1.0, 1.0) * STEER_V_MAX
     if (steer_v < 0.0 and delta <= STEER_MIN) or (steer_v > 0.0 and delta >= STEER_MAX):
