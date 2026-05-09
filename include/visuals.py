@@ -45,8 +45,9 @@ class Visuals:
 
         # Initialize map
         self.initialized_all_agents = False
+        self.lidar_hit_points = wp.zeros(NUM_LIDAR, dtype=wp.vec3, device=self.env.device)
+
         self._setup_map()
-        self._setup_static_objects()
         self._setup_dynamic_objects()
 
     def interactive_render_loop(self):
@@ -77,9 +78,26 @@ class Visuals:
         self._clear()
 
     def _setup_map(self):
+        self._setup_map_ground()
         self._setup_map_grid()
         self._setup_map_walls()
         self._setup_map_center_line()
+
+    def _setup_map_ground(self):
+        physical_width = self.map.w * self.map.res
+        physical_length = self.map.h * self.map.res
+
+        center_x = self.map.ox + (physical_width / 2.0)
+        center_y = self.map.oy + (physical_length / 2.0)
+
+        self.renderer.render_plane(
+            name="map_ground",
+            pos=[center_x, center_y, 0.0],
+            rot=np.array(wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), np.pi / 2.0)),
+            width=physical_width / 2.0,
+            length=physical_length / 2.0,
+            color=(0.15, 0.15, 0.15) # Dark gray looks great under a grid
+        )
 
     def _setup_map_grid(self):
         pixel_size = self.map.res 
@@ -116,6 +134,15 @@ class Visuals:
         # Combine them
         self.grid_vertices = np.vstack([v_verts, h_verts])
         self.grid_indices = np.arange(len(self.grid_vertices), dtype=np.int32)
+
+        # Render grid
+        self.renderer.render_line_list(
+            name="pixel_grid",
+            vertices=self.grid_vertices,
+            indices=self.grid_indices,
+            color=(0, 0, 0),
+            radius=0.005
+        )
     
     def _setup_map_walls(self):
         dilated_free = binary_dilation(self.map.free)
@@ -139,38 +166,7 @@ class Visuals:
         self.wall_vertices = np.zeros((num_wall_points, 3), dtype=np.float32)
         self.wall_vertices[:, 0] = wall_x
         self.wall_vertices[:, 1] = wall_y
-        self.wall_vertices[:, 2] = 0.02 # Float slightly above the ground
-
-    def _setup_map_center_line(self):
-        num_points = len(self.map.centerline)
-        self.track_vertices = np.zeros((num_points, 3), dtype=np.float32)
-        self.track_vertices[:, 0] = self.map.centerline[:, 0]
-        self.track_vertices[:, 1] = self.map.centerline[:, 1]
-        self.track_vertices[:, 2] = 0.02
-
-    def _setup_static_objects(self):
-        physical_width = self.map.w * self.map.res
-        physical_length = self.map.h * self.map.res
-
-        center_x = self.map.ox + (physical_width / 2.0)
-        center_y = self.map.oy + (physical_length / 2.0)
-        self.renderer.render_plane(
-            name="map_ground",
-            pos=[center_x, center_y, 0.0],
-            rot=np.array(wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), np.pi / 2.0)),
-            width=physical_width / 2.0,
-            length=physical_length / 2.0,
-            color=(0.15, 0.15, 0.15) # Dark gray looks great under a grid
-        )
-
-        # Pixel Grid
-        self.renderer.render_line_list(
-            name="pixel_grid",
-            vertices=self.grid_vertices,
-            indices=self.grid_indices,
-            color=(0, 0, 0),
-            radius=0.005
-        )
+        self.wall_vertices[:, 2] = 0.05
 
         # Walls
         self.renderer.render_points(
@@ -180,6 +176,13 @@ class Visuals:
             radius=0.05
         )
 
+    def _setup_map_center_line(self):
+        num_points = len(self.map.centerline)
+        self.track_vertices = np.zeros((num_points, 3), dtype=np.float32)
+        self.track_vertices[:, 0] = self.map.centerline[:, 0]
+        self.track_vertices[:, 1] = self.map.centerline[:, 1]
+        self.track_vertices[:, 2] = 0.05
+        
         # Center line
         self.renderer.render_points(
             name="center_line",
@@ -248,10 +251,18 @@ class Visuals:
 
     def _render(self):
         # Warp Render Begin
-        time = self.env._call * DT #self.renderer.clock_time
+        time = self.env._call * DT # Represent actual simulation time
         self.renderer.begin_frame(time)
 
         # Begin Render
+        self.render_user_car()
+        self.render_user_lidar()
+        # End Render
+
+        # Warp Render End
+        self.renderer.end_frame()
+
+    def render_user_car(self):
         car_state = self.env.cars_buf[0].cpu().numpy()
         car_x, car_y, car_psi = car_state[0], car_state[1], car_state[4]
         car_rot = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(car_psi))
@@ -261,55 +272,35 @@ class Visuals:
             pos=[car_x, car_y, 0.15], 
             rot=np.array(car_rot)
         )
-        self.render_lidar_old()
-        # End Render
 
-        # Warp Render End
-        self.renderer.end_frame()
-
-    def render_lidar(self):
-        pass
-
-    def render_lidar_old(self):
-        # Pull data from GPU to CPU
-        obs = self.env.obs_buf.cpu().numpy()[0]
-        car_state = self.env.cars_buf.cpu().numpy()[0]
-        lidar_dirs = self.env.lidar_buf.numpy()  
+    def render_user_lidar(self):
+        """
+        Zero-copy GPU rendering of all LiDAR points.
+        """
+        # We need the PyTorch tensors as Warp arrays for the kernel
+        # wp.from_torch() is a zero-copy operation (instantaneous)
+        obs_wp = wp.from_torch(self.env.obs_buf.contiguous(), dtype=wp.float32)
+        cars_wp = wp.from_torch(self.env.cars_buf.contiguous(), dtype=wp.float32)
         
-        # Extract Car 0's State
-        car_x = car_state[0]
-        car_y = car_state[1]
-        car_psi = car_state[4] 
+        # Launch the kernel with 1 thread per ray
+        wp.launch(
+            kernel=calc_single_lidar_hits_kernel,
+            dim=NUM_LIDAR,
+            inputs=[
+                obs_wp,
+                cars_wp,
+                self.env.lidar_buf,
+                self.lidar_hit_points
+            ],
+            device=self.env.device
+        )
         
-        # Calculate true LiDAR origin
-        lx = car_x + LF * np.cos(car_psi)
-        ly = car_y + LF * np.sin(car_psi)
-        
-        # Extract distances (Starts at index 3, and spans exactly num_rays)
-        num_rays = len(lidar_dirs)
-        distances = obs[3 : 3 + num_rays]
-        
-        # Extract local angles directly from your lidar_buf
-        # lidar_dirs[:, 0] is cos(angle), lidar_dirs[:, 1] is sin(angle)
-        local_angles = np.arctan2(lidar_dirs[:, 1], lidar_dirs[:, 0])
-        
-        # Calculate global angle for Car 0's rays
-        global_angles = car_psi + local_angles
-        
-        # Trigonometry to find X, Y hit points
-        hit_xs = lx + distances * np.cos(global_angles)
-        hit_ys = ly + distances * np.sin(global_angles)
-        
-        # Set Z height slightly above ground
-        hit_zs = np.full_like(hit_xs, 0.1) 
-        
-        # Stack into a list of 3D coordinates: [[x,y,z], [x,y,z]...]
-        points_3d = np.stack([hit_xs, hit_ys, hit_zs], axis=-1)
-        
+        # Pass the Warp array DIRECTLY to the renderer
+        # Because we don't call .numpy(), the data never leaves the GPU!
         self.renderer.render_points(
-            name="lidar_cloud_car_0", 
-            points=points_3d,
-            radius=0.05,               
+            name="lidar_cloud_0",
+            points=self.lidar_hit_points,
+            radius=0.025,
             colors=(0.0, 1.0, 1.0)
         )
 
@@ -317,3 +308,40 @@ class Visuals:
         self.imgui_manager.shutdown()
         self.renderer.clear()
 
+@wp.kernel
+def calc_single_lidar_hits_kernel(
+    obs: wp.array2d[wp.float32],
+    cars: wp.array2d[wp.float32],
+    lidar_dirs: wp.array[wp.vec2],
+    hit_points: wp.array[wp.vec3]
+):
+    # Get the unique thread ID (0 to total_points - 1)
+    tid = wp.tid()
+    
+    # Map the 1D thread ID back to a specific car and ray
+    ray_idx = tid
+    
+    # Extract Car State
+    car_x = cars[0, 0]
+    car_y = cars[0, 1]
+    car_psi = cars[0, 4]
+    
+    # True LiDAR origin
+    lx = car_x + LF * wp.cos(car_psi)
+    ly = car_y + LF * wp.sin(car_psi)
+    
+    # Extract Distance (starts at index 3)
+    dist = obs[0, 3 + ray_idx]
+    
+    # Global Angle Math
+    local_dir = lidar_dirs[ray_idx]
+    local_angle = wp.atan2(local_dir[1], local_dir[0])
+    global_angle = car_psi + local_angle
+    
+    # Calculate Hit coordinates
+    hit_x = lx + dist * wp.cos(global_angle)
+    hit_y = ly + dist * wp.sin(global_angle)
+    hit_z = 0.125
+    
+    # Write directly to the render buffer
+    hit_points[tid] = wp.vec3(hit_x, hit_y, hit_z)
