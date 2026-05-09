@@ -10,6 +10,7 @@ from yaml import safe_load
 
 from include.constants import *
 
+
 class Map:
     def __init__(self, path: Path):
         self.meta = safe_load(path.read_text())

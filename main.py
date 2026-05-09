@@ -5,6 +5,8 @@ import numpy as np
 import warp as wp
 from typer import run
 
+from include.agent import Agent, train
+from include.constants import *
 from include.environment import Environment
 
 # If you see this error and you have more than one GPU (iGPU & eGPU):
@@ -12,6 +14,7 @@ from include.environment import Environment
 #   Falling back to copy operations between the Warp array and the OpenGL buffer."
 # Then you have to make sure ALL aspects of the Python program is running on GPU. On Windows you find
 # the Python executable and set to "High Performance" in Windows Graphics settings.
+
 def main(
     map_yaml: Path =  Path(".\\maps\\berlin.yaml"),
     num_envs: int = 1024,
@@ -21,7 +24,7 @@ def main(
     record_every: int = 100,
     record_steps: int = 2000,
     device: str = None,
-    use_wandb: bool = True,
+    use_wandb: bool = False,
     log_dir: Path = Path("./logs"),
 ):
     if interactive:
@@ -45,9 +48,38 @@ def main(
         if interactive:
             env.vs.interactive_render_loop()
         else:
-            print("TODO")
-            pass
+            agent = Agent(obs_dim=OBS_DIM).to(str(env.device))
+            elapsed, obs_rms, ret_rms, step = train(
+                env,
+                agent,
+                iterations=iterations,
+                log_dir=log_dir,
+                record_every=record_every,
+                record_steps=record_steps,
+            )
+
+            print(f"[Done!] {elapsed:.1f}s")
+
+            torch.save(
+                {
+                    "agent": agent.state_dict(),
+                    "obs_mean": obs_rms.mean.cpu(),
+                    "obs_var": obs_rms.var.cpu(),
+                    "obs_count": obs_rms.count,
+                },
+                log_dir / "agent_final.pt",
+            )
+
+            print(f"[Saved!]")
+
+            # TODO: Implement W&B
+            # out = log_dir / "rollout_final.mp4"
+            # record_rollout(env, agent, record_steps, out, obs_rms=obs_rms)
+            # try:
+            #     wandb.log({"rollout_final": wandb.Video(str(out), format="mp4")}, step=step)
+            # except Exception:
+            #     pass
 
 if __name__ == "__main__":
     #run(main)
-    main()
+    main(interactive=False, num_envs=1024, map_yaml=Path(".//maps//berlin.yaml"))

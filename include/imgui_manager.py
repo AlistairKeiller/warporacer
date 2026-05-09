@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING # Forward declaration
+from typing import TYPE_CHECKING  # Forward declaration
 
 import warp as wp
 from imgui_bundle import imgui

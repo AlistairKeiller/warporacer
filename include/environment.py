@@ -93,6 +93,31 @@ class Environment:
             self.done_buf == DONE_TRUNCATED,
             {},
         )
+    
+    def reset(self):
+        self._step_counter.fill_(MAX_STEPS)
+        self._launch(self._zero_act)
+        self._sanitize()
+        self._step_counter.zero_()
+        self.rew_buf.zero_()
+        self.done_buf.zero_()
+        return self.obs_buf, {}
+
+    def save_state(self):
+        return {
+            k: getattr(self, k).clone()
+            for k in ("cars_buf", "cars_int_buf", "obs_buf", "rew_buf", "done_buf")
+        } | {
+            "car_dr": wp.to_torch(self.car_dr).clone(),
+        }
+
+    def restore_state(self, s):
+        self.cars_buf.copy_(s["cars_buf"])
+        self.cars_int_buf.copy_(s["cars_int_buf"])
+        wp.to_torch(self.car_dr).copy_(s["car_dr"])
+        self.obs_buf.copy_(s["obs_buf"])
+        self.rew_buf.copy_(s["rew_buf"])
+        self.done_buf.copy_(s["done_buf"])
 
     def _launch(self, act):
         seed = (self.seed_base * 2654435761 + self._call * 83492791) & 0x7FFFFFFF

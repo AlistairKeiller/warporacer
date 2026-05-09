@@ -1,12 +1,12 @@
 import time
-from typing import TYPE_CHECKING # Forward declaration
+from typing import TYPE_CHECKING  # Forward declaration
 
 import numpy as np
 import pyglet
 import warp as wp
 import warp.render  # Must include for OpenGLRenderer
-from scipy.ndimage import binary_dilation
 from pyglet.window import key
+from scipy.ndimage import binary_dilation
 
 from include.constants import *
 from include.imgui_manager import ImGuiManager
@@ -30,8 +30,10 @@ class Visuals:
             near_plane=0.1,
             far_plane=1000,
             up_axis="Z", # Cannot change sun direction because it's hard coded in! Cringe!
+            background_color=(0,0,0),
             draw_grid=False,
             draw_axis=False,
+            draw_sky=False,
             device=wp.get_device()
         )
 
@@ -73,13 +75,31 @@ class Visuals:
                 user_actions[0, 0] = steering
                 user_actions[0, 1] = throttle
                 self.env.step(user_actions)
-                self._render()
+                self.render()
 
         self._clear()
 
+    def render(self):
+        # Warp Render Begin
+        time = self.env._call * DT # Represent actual simulation time
+        self.renderer.begin_frame(time)
+
+        # Begin Render
+        # TODO : Make this a ImGUI toggle for performance reasons
+        if self.env.num_envs > 1:
+            self._render_all_agents()
+        else:
+            self._render_user_car()
+
+        self._render_user_lidar()
+        # End Render
+
+        # Warp Render End
+        self.renderer.end_frame()
+
     def _setup_map(self):
         self._setup_map_ground()
-        self._setup_map_grid()
+        #self._setup_map_grid() # Disable to remove Moire pattern effect
         self._setup_map_walls()
         self._setup_map_center_line()
 
@@ -96,7 +116,7 @@ class Visuals:
             rot=np.array(wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), np.pi / 2.0)),
             width=physical_width / 2.0,
             length=physical_length / 2.0,
-            color=(0.15, 0.15, 0.15) # Dark gray looks great under a grid
+            color=(0.15, 0.15, 0.15)
         )
 
     def _setup_map_grid(self):
@@ -206,18 +226,29 @@ class Visuals:
     
     def _render_all_agents(self):
         if not self.initialized_all_agents:
+            all_car_states = self.env.cars_buf.cpu().numpy()
+            
             for i in range(self.env.num_envs):
-                car_state = self.env.cars_buf[i].cpu().numpy()
+                percent = float(i / self.env.num_envs)
+                car_state = all_car_states[i]
                 car_x, car_y, car_psi = car_state[0], car_state[1], car_state[4]
-
                 car_rot = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(car_psi))
 
+                car_name = f"car_{i}"
+
                 self.renderer.render_box(
-                    name=f"car_{i}",
+                    name=car_name,
                     pos=[car_x, car_y, 0.15], 
                     rot=np.array(car_rot),
-                    extents=[LENGTH / 2.0, WIDTH / 2.0, 0.1],
-                    color=(1.0, 1.0, 0) # Dynamic colors doesn't work with instancing
+                    extents=[LENGTH / 2.0, WIDTH / 2.0, 0.1]
+                )
+
+                # This is a bottleneck for over 8192 agents, but only way to color each agent
+                car_color = (1.0 - percent, 1.0 - percent, percent)
+                self.renderer.update_shape_instance(
+                    name=car_name,
+                    color1=car_color,
+                    color2=car_color
                 )
             
             print("_render_all_agents: self.initialized_all_agents = True")
@@ -249,20 +280,7 @@ class Visuals:
                 rot=np.array(quats[i])
             )
 
-    def _render(self):
-        # Warp Render Begin
-        time = self.env._call * DT # Represent actual simulation time
-        self.renderer.begin_frame(time)
-
-        # Begin Render
-        self.render_user_car()
-        self.render_user_lidar()
-        # End Render
-
-        # Warp Render End
-        self.renderer.end_frame()
-
-    def render_user_car(self):
+    def _render_user_car(self):
         car_state = self.env.cars_buf[0].cpu().numpy()
         car_x, car_y, car_psi = car_state[0], car_state[1], car_state[4]
         car_rot = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(car_psi))
@@ -273,7 +291,7 @@ class Visuals:
             rot=np.array(car_rot)
         )
 
-    def render_user_lidar(self):
+    def _render_user_lidar(self):
         """
         Zero-copy GPU rendering of all LiDAR points.
         """
@@ -300,7 +318,7 @@ class Visuals:
         self.renderer.render_points(
             name="lidar_cloud_0",
             points=self.lidar_hit_points,
-            radius=0.025,
+            radius=0.05,
             colors=(0.0, 1.0, 1.0)
         )
 
@@ -341,7 +359,7 @@ def calc_single_lidar_hits_kernel(
     # Calculate Hit coordinates
     hit_x = lx + dist * wp.cos(global_angle)
     hit_y = ly + dist * wp.sin(global_angle)
-    hit_z = 0.125
+    hit_z = 0.150
     
     # Write directly to the render buffer
     hit_points[tid] = wp.vec3(hit_x, hit_y, hit_z)

@@ -74,6 +74,7 @@ ADJ = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 DONE_TERMINATED = 1
 DONE_TRUNCATED = 2
 
+
 @wp.struct
 class VDeriv:
     d_x: float
@@ -82,6 +83,7 @@ class VDeriv:
     d_psip: float
     d_beta: float
     d_v: float
+
 
 @wp.func
 def st_deriv(
@@ -121,6 +123,7 @@ def st_deriv(
     out.d_psip = 0.0
     out.d_beta = 0.0
     return out
+
 
 @wp.func
 def rk4_step(
@@ -191,6 +194,7 @@ def rk4_step(
         k1.d_beta + 2.0 * k2.d_beta + 2.0 * k3.d_beta + k4.d_beta
     ) * DT_SUB_SIX
     return out
+
 
 @wp.kernel
 def step_kernel(
@@ -382,6 +386,7 @@ def step_kernel(
     cars_int[i, 0] = steps
     cars_int[i, 1] = new_wp
 
+
 # Map
 class Map:
     def __init__(self, path: Path):
@@ -461,6 +466,7 @@ class Map:
         self.lut = tree.query(
             np.column_stack([rows.ravel(), cols.ravel()]), workers=-1
         )[1].reshape(rows.shape)
+
 
 # Env
 class RacingEnv:
@@ -603,6 +609,7 @@ class RacingEnv:
         self.rew_buf.copy_(s["rew_buf"])
         self.done_buf.copy_(s["done_buf"])
 
+
 # PPO components
 class RunningMeanStd:
     def __init__(self, shape, device):
@@ -627,6 +634,7 @@ class RunningMeanStd:
     def normalize(self, x, clip: float = 10.0):
         return ((x - self.mean) * self.inv_std).clamp(-clip, clip)
 
+
 class ReturnNormalizer:
     def __init__(self, num_envs, gamma, device):
         self.gamma = gamma
@@ -640,10 +648,12 @@ class ReturnNormalizer:
     def normalize(self, reward):
         return reward * self.rms.inv_std
 
+
 def layer_init(layer, std=np.sqrt(2.0), bias=0.0):
     nn.init.orthogonal_(layer.weight, std)
     nn.init.constant_(layer.bias, bias)
     return layer
+
 
 class Agent(nn.Module):
     LOGSTD_MIN, LOGSTD_MAX = -1.6, -0.3
@@ -683,6 +693,7 @@ class Agent(nn.Module):
     def deterministic(self, obs):
         return self.actor(obs)
 
+
 class KLAdaptiveLR:
     def __init__(self, opt, target_kl=0.02, factor=1.5, lr_min=1e-6, lr_max=3e-3):
         self.opt = opt
@@ -702,6 +713,7 @@ class KLAdaptiveLR:
     @property
     def lr(self):
         return self.opt.param_groups[0]["lr"]
+
 
 # Rollout video
 def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
@@ -761,6 +773,7 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
     finally:
         env.restore_state(snap)
         agent.train(was_training)
+
 
 # PPO training
 def train(
@@ -955,6 +968,7 @@ def train(
                 print(f"[rollout {it + 1}] failed: {e}")
     return time.time() - t0, obs_rms, ret_rms, global_step
 
+
 def main(
     map_yaml: Path,
     num_envs: int = 4096,
@@ -1018,6 +1032,7 @@ def main(
         wandb.log({"rollout_final": wandb.Video(str(out), format="mp4")}, step=step)
     except Exception:
         pass
+
 
 if __name__ == "__main__":
     run(main)
