@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import warp as wp
 from typer import run
+import os
 
 from include.agent import Agent, train
 from include.constants import *
@@ -82,4 +83,7 @@ def main(
 
 if __name__ == "__main__":
     #run(main)
-    main(interactive=False, num_envs=1024, map_yaml=Path(".//maps//berlin.yaml"))
+    if os.name == "nt":
+        main(interactive=False, num_envs=1024, map_yaml=Path(".//maps//berlin.yaml"))
+    else:
+        main(interactive=False, num_envs=1024, map_yaml=Path("./maps/berlin.yaml"))

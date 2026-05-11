@@ -9,7 +9,7 @@ if TYPE_CHECKING:
 
 class ImGuiManager:
     # ImGUI uses Top Left origin while Pyglet is Bottom Left and you have to remember DPI scaling!
-    def __init__(self, renderer: wp.render.OpenGLRenderer, env: Environment):
+    def __init__(self, renderer: wp.render.OpenGLRenderer, env: "Environment"):
         imgui.create_context()
         self.renderer = renderer
         self.env = env

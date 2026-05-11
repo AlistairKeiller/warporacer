@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from include.environment import Environment
 
 class Visuals:
-    def __init__(self, env: Environment, map: Map):
+    def __init__(self, env: "Environment", map: Map):
         self.env = env
         self.map = map
     

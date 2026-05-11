@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 from skimage import filters
 from pathlib import Path
 from yaml import safe_load
+import os
 
 from cv2 import (
     IMREAD_GRAYSCALE,
@@ -10,7 +11,11 @@ from cv2 import (
 
 OCC_THRESH = 230
 
-path = Path(".\\maps\\stata_basement.yaml")
+# Path based on OS
+if os.name == "nt":  # Windows
+    path = Path(".\\maps\\stata_basement.yaml")
+else: # Posix
+    path = Path("./maps/stata_basement.yaml")
 meta = safe_load(path.read_text())
 img_path = path.parent / meta["image"]
 raw = imread(str(img_path), IMREAD_GRAYSCALE)

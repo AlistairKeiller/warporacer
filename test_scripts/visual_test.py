@@ -136,5 +136,10 @@ class Visuals:
         self.renderer.clear()
 
 if __name__ == "__main__":
-    with wp.ScopedDevice("cuda"):
-        vs = Visuals()
+    # Check if CUDA is available and if not, use cpu
+    if not wp.is_cuda_available():
+        with wp.ScopedDevice("cpu"):
+            vs = Visuals()
+    else:
+        with wp.ScopedDevice("cuda"):
+            vs = Visuals()
