@@ -7,6 +7,7 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 import torch.nn as nn
+import wandb
 import warp as wp
 from cv2 import (
     COLOR_GRAY2RGB,
@@ -23,8 +24,6 @@ from skimage.morphology import skeletonize
 from torch.distributions import Normal
 from typer import run
 from yaml import safe_load
-
-import wandb
 
 MU = 1.0489
 LF = 0.15875
@@ -478,11 +477,12 @@ class RacingEnv:
     ):
         wp.init()
         self.num_envs = num_envs
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        requested = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        d = wp.get_device(requested)
+        self.device = str(d)
         self.map = Map(map_path)
         self.look_step = self.map.look_step
         self.seed_base = int(seed)
-        d = self.device
 
         self.dt_buf = wp.array(self.map.dt.T.astype(np.float32), dtype=float, device=d)
         self.lut_buf = wp.array(self.map.lut.T.astype(np.int32), dtype=int, device=d)
@@ -557,6 +557,7 @@ class RacingEnv:
                 self.lidar_buf,
                 int(seed),
             ],
+            device=self.cars.device,
         )
         wp.synchronize_device(self.cars.device)
         self._call += 1
@@ -583,7 +584,8 @@ class RacingEnv:
         return self.obs_buf, {}
 
     def step(self, action):
-        self._launch(wp.from_torch(action.detach().contiguous(), dtype=wp.vec2))
+        act = action.detach().to(self.obs_buf.device, non_blocking=True).contiguous()
+        self._launch(wp.from_torch(act, dtype=wp.vec2))
         self._sanitize()
         return (
             self.obs_buf,
