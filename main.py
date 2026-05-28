@@ -710,7 +710,7 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
         obs = obs_rms.normalize(raw) if obs_rms else raw
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with imageio.get_writer(
-            str(out_path), fps=int(1 / DT), macro_block_size=1
+            str(out_path), fps=int(1 / DT), macro_block_size=2
         ) as w:
             with torch.no_grad():
                 for _ in range(num_steps):
