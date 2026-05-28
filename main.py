@@ -60,10 +60,8 @@ TERM_PENALTY = 10.0
 NUM_LIDAR = 108
 LIDAR_FOV = np.radians(270.0)
 LIDAR_RANGE = 20.0
-NUM_LOOKAHEAD = 10
-OBS_FRENET_OFF = 3 + NUM_LIDAR
-OBS_LOOK_OFF = OBS_FRENET_OFF + 2
-OBS_DIM = OBS_LOOK_OFF + 2 * NUM_LOOKAHEAD
+OBS_LIDAR_OFF = 2
+OBS_DIM = OBS_LIDAR_OFF + NUM_LIDAR
 ACT_DIM = 2
 MAX_STEPS = 10_000
 
@@ -210,7 +208,6 @@ def step_kernel(
     cl_lut: wp.array2d(dtype=wp.int32),
     centerline: wp.array(dtype=wp.vec3),
     n_cl: int,
-    look_step: int,
     lidar_dirs: wp.array(dtype=wp.vec2),
     seed_base: int,
 ):
@@ -347,34 +344,10 @@ def step_kernel(
             dist += step_px
             if step_px == 0.0:
                 break
-        obs[i, 3 + j] = wp.min(dist, lrange_px) * res
-
-    # Frenet + lookahead
-    cpt = centerline[new_wp]
-    cx_p = cpt[0]
-    cy_p = cpt[1]
-    cth_p = cpt[2]
-    s_cth = wp.sin(cth_p)
-    c_cth = wp.cos(cth_p)
-    heading_err = wp.atan2(s_cth * ch - c_cth * sh, c_cth * ch + s_cth * sh)
-    lateral_err = -(x - cx_p) * s_cth + (y - cy_p) * c_cth
-    obs[i, OBS_FRENET_OFF] = heading_err
-    obs[i, OBS_FRENET_OFF + 1] = lateral_err
-
-    idx = new_wp
-    for k in range(NUM_LOOKAHEAD):
-        idx += look_step
-        if idx >= n_cl:
-            idx -= n_cl
-        w = centerline[idx]
-        dx = w[0] - x
-        dy = w[1] - y
-        obs[i, OBS_LOOK_OFF + k * 2] = dx * ch + dy * sh
-        obs[i, OBS_LOOK_OFF + k * 2 + 1] = -dx * sh + dy * ch
+        obs[i, OBS_LIDAR_OFF + j] = wp.min(dist, lrange_px) * res
 
     obs[i, 0] = delta
     obs[i, 1] = v
-    obs[i, 2] = psip
     cars[i, 0] = x
     cars[i, 1] = y
     cars[i, 2] = delta
@@ -450,8 +423,6 @@ class Map:
         self.centerline = savgol_filter(world, SMOOTH_WINDOW, 3, axis=0, mode="wrap")
         diffs = np.diff(self.centerline, axis=0, append=self.centerline[:1])
         self.angles = np.arctan2(diffs[:, 1], diffs[:, 0])
-        avg_sp = float(np.linalg.norm(diffs, axis=1).mean())
-        self.look_step = max(1, int(round(1.0 / avg_sp)))
 
     def _build_lut(self):
         cl_px = np.column_stack(
@@ -481,7 +452,6 @@ class RacingEnv:
         d = wp.get_device(requested)
         self.device = str(d)
         self.map = Map(map_path)
-        self.look_step = self.map.look_step
         self.seed_base = int(seed)
 
         self.dt_buf = wp.array(self.map.dt.T.astype(np.float32), dtype=float, device=d)
@@ -553,7 +523,6 @@ class RacingEnv:
                 self.lut_buf,
                 self.centerline_buf,
                 self.n_cl,
-                self.look_step,
                 self.lidar_buf,
                 int(seed),
             ],
@@ -1024,6 +993,21 @@ def main(
             "obs_mean": obs_rms.mean.cpu(),
             "obs_var": obs_rms.var.cpu(),
             "obs_count": obs_rms.count,
+            "config": {
+                "obs_dim": OBS_DIM,
+                "act_dim": ACT_DIM,
+                "hidden": 256,
+                "num_lidar": NUM_LIDAR,
+                "lidar_fov": float(LIDAR_FOV),
+                "lidar_range": LIDAR_RANGE,
+                "steer_v_max": STEER_V_MAX,
+                "a_max": A_MAX,
+                "steer_min": STEER_MIN,
+                "steer_max": STEER_MAX,
+                "v_min": V_MIN,
+                "v_max": V_MAX,
+                "dt": DT,
+            },
         },
         log_dir / "agent_final.pt",
     )
