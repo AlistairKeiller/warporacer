@@ -85,11 +85,8 @@ class Visuals:
         self.renderer.begin_frame(time)
 
         # Begin Render
-        # TODO : Make this a ImGUI toggle for performance reasons
-        if self.env.num_envs > 1:
-            self._render_all_agents()
-        else:
-            self._render_user_car()
+        #self._render_all_agents() # TODO : Make this a ImGUI toggle for performance reasons
+        self._render_user_car()
 
         self._render_user_lidar()
         # End Render

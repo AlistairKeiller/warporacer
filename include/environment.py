@@ -57,12 +57,14 @@ class Environment:
     def __init__(self,
                  map_yaml: Path = Path(".\\maps\\berlin.yaml"),
                  num_envs: int = 1,
-                 seed: int = 0
+                 seed: int = 0,
+                 live_viewer: bool = True
         ) -> None:
         self.map_yaml = map_yaml
         self.num_envs = num_envs
         self.seed = seed
         self.seed_base = seed 
+        self.live_viewer = live_viewer
 
         self.device = wp.get_device()
         self.map = Map(self.map_yaml)
@@ -70,7 +72,8 @@ class Environment:
         # Initialize core physics tracking variables
         self._init_cars()
 
-        self.vs = Visuals(self, self.map)
+        if self.live_viewer:
+            self.vs = Visuals(self, self.map)
 
     def _init_cars(self) -> None:
         self.look_step = self.map.look_step

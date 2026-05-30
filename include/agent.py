@@ -8,6 +8,7 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 import torch.nn as nn
+import wandb
 from cv2 import COLOR_GRAY2RGB, cvtColor, fillPoly, polylines
 from torch.distributions import Normal
 
@@ -302,6 +303,7 @@ def train(
     log_dir: Path = Path("./logs"),
     record_every: int = 100,
     record_steps: int = 1800,
+    use_wandb_train: bool = False
 ) -> Tuple[float, RunningMeanStd, ReturnNormalizer, int]:
     device: torch.device = next(agent.parameters()).device
     N: int = env.num_envs
@@ -353,7 +355,7 @@ def train(
                 logp_b[t] = logp
                 val_b[t] = val
                 raw, raw_rew, term, trunc, _ = env.step(act)
-                raw_obs_b[t] = raw 
+                raw_obs_b[t] = raw
 
                 done: torch.Tensor = (term | trunc).float()
                 ret_rms.update(raw_rew, done)
@@ -370,6 +372,11 @@ def train(
                     ep_ret[fin] = 0.0
                     ep_len[fin] = 0.0
                 obs = obs_rms.normalize(raw)
+
+                # Render every 3rd frame
+                if env.live_viewer and t % 3 == 0:
+                    env.vs.render()
+                
             next_val: torch.Tensor = agent.value(obs)
 
         obs_rms.update(raw_obs_b)
@@ -420,8 +427,6 @@ def train(
                 stats["kl"] += approx_kl.clone()
                 stats["clipfrac"] += clipfrac.clone()
                 n_upd += 1
-
-            #env.vs.render() # Live rendering of training
                 
         divisor = max(n_upd, 1)
         for k in stats:
@@ -458,8 +463,12 @@ def train(
             log["ep_return"] = float(np.mean(finished_rets))
             log["ep_length"] = float(np.mean(finished_lens))
 
-        # Restored wandb debug print
-        #print(f"wandb.log: global_step={global_step}")
+        # Update wandb
+        if use_wandb_train:
+            try:
+                wandb.log(log, step=global_step)
+            except Exception as e:
+                print(f"[WandB] Log failed: {e}")
 
         if it % 10 == 0:
             er: float = log.get("ep_return", float("nan"))
@@ -473,5 +482,11 @@ def train(
             out: Path = log_dir / f"rollout_iter{it + 1:06d}.mp4"
             print(f"record_rollout: out={out}")
             record_rollout(env, agent, record_steps, out, obs_rms)
+
+            if use_wandb_train:
+                try:
+                    wandb.log({"rollout": wandb.Video(str(out), format="mp4")}, step=global_step)
+                except Exception as e:
+                    print(f"[WandB] Rollout video failed: {e}")
             
     return time.time() - t0, obs_rms, ret_rms, global_step

@@ -5,6 +5,7 @@ import numpy as np
 import warp as wp
 from typer import run
 import os
+import wandb
 
 from include.agent import Agent, train, record_rollout
 from include.constants import *
@@ -21,6 +22,7 @@ def main(
     num_envs: int = 1024,
     seed: int = 0,
     interactive: bool = True,
+    live_viewer: bool = False,
     iterations: int = 2000,
     record_every: int = 100,
     record_steps: int = 2000,
@@ -28,8 +30,11 @@ def main(
     use_wandb: bool = False,
     log_dir: Path = Path("./logs"),
 ):
+    
+    # Interactive mode overrides
     if interactive:
         num_envs = 1
+        live_viewer = True
 
     if not device:
         device = wp.get_device()
@@ -44,11 +49,26 @@ def main(
         torch.backends.cudnn.allow_tf32 = True
 
     with wp.ScopedDevice(device):
-        env = Environment(map_yaml, num_envs, seed)
+        env = Environment(map_yaml, num_envs, seed, live_viewer)
 
         if interactive:
             env.vs.interactive_render_loop()
         else:
+            if use_wandb:
+                try:
+                    wandb.init(
+                        project="warporacer",
+                        name=f"seed{seed}_n{num_envs}",
+                        config={
+                            "num_envs": num_envs,
+                            "iterations": iterations,
+                            "seed": seed,
+                            "map": str(map_yaml),
+                        },
+                    )
+                except Exception as e:
+                    print(f"[WandB] Init failed: {e}")
+                    
             agent = torch.compile(Agent(obs_dim=OBS_DIM).to(str(env.device)))
             elapsed, obs_rms, ret_rms, step = train(
                 env,
@@ -57,6 +77,7 @@ def main(
                 log_dir=log_dir,
                 record_every=record_every,
                 record_steps=record_steps,
+                use_wandb_train=use_wandb
             )
 
             print(f"[Done!] {elapsed:.1f}s")
@@ -76,11 +97,11 @@ def main(
             out = log_dir / "rollout_final.mp4"
             record_rollout(env, agent, record_steps, out, obs_rms=obs_rms)
 
-            # if use_wandb:
-            #     try:
-            #         wandb.log({"rollout_final": wandb.Video(str(out), format="mp4")}, step=step)
-            #     except Exception:
-            #         pass
+            if use_wandb:
+                try:
+                    wandb.log({"rollout_final": wandb.Video(str(out), format="mp4")}, step=step)
+                except Exception as e:
+                    print(f"[WandB] Final rollout video failed: {e}")
 
 if __name__ == "__main__":
     run(main)
