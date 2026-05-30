@@ -6,7 +6,7 @@ import warp as wp
 from typer import run
 import os
 
-from include.agent import Agent, train
+from include.agent import Agent, train, record_rollout
 from include.constants import *
 from include.environment import Environment
 
@@ -73,21 +73,22 @@ def main(
 
             print(f"[Saved!]")
 
-            # TODO: Implement W&B
-            # out = log_dir / "rollout_final.mp4"
-            # record_rollout(env, agent, record_steps, out, obs_rms=obs_rms)
-            # try:
-            #     wandb.log({"rollout_final": wandb.Video(str(out), format="mp4")}, step=step)
-            # except Exception:
-            #     pass
+            out = log_dir / "rollout_final.mp4"
+            record_rollout(env, agent, record_steps, out, obs_rms=obs_rms)
+
+            # if use_wandb:
+            #     try:
+            #         wandb.log({"rollout_final": wandb.Video(str(out), format="mp4")}, step=step)
+            #     except Exception:
+            #         pass
 
 if __name__ == "__main__":
-    #run(main)
-    main(interactive=False, num_envs=8192, map_yaml=Path(".//maps//berlin.yaml"))
-    
-    # if os.name == "nt":
-    #     main(interactive=False, num_envs=1024, map_yaml=Path(".//maps//berlin.yaml"))
-    # else:
-    #     main(interactive=False, num_envs=1024, map_yaml=Path("./maps/berlin.yaml"))
+    run(main)
 
+# Notes:
+# main(interactive=False, num_envs=16384, map_yaml=Path(".//maps//berlin.yaml"))
+# if os.name == "nt":
+#     main(interactive=False, num_envs=1024, map_yaml=Path(".//maps//berlin.yaml"))
+# else:
+#     main(interactive=False, num_envs=1024, map_yaml=Path("./maps/berlin.yaml"))
 # env.vs.render() # Live rendering of training

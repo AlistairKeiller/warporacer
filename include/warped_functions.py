@@ -26,22 +26,27 @@ def st_deriv(
     lf_s: float,
     lr_s: float,
 ) -> VDeriv:
+    # Scale static physical dimensions by the randomized environment coefficients
     lf = LF * lf_s
     lr = LR * lr_s
     lwb = lf + lr
     mu = MU * mu_s
     a_max = mu * G
 
+    # Calculate kinematic angular velocity bounds
     tand = wp.tan(delta)
     d_psi_kin = v * tand / lwb
     d_psi_cap = a_max / wp.max(wp.abs(v), 0.5)
     d_psi = wp.clamp(d_psi_kin, -d_psi_cap, d_psi_cap)
 
+    # Project tire traction constraints into friction ellipse boundaries
     a_lat = v * d_psi
     a_long_max = wp.sqrt(wp.max(a_max * a_max - a_lat * a_lat, 0.0))
 
     cp = wp.cos(psi)
     sp = wp.sin(psi)
+    
+    # Populate the output structural representation
     out = VDeriv()
     out.d_x = v * cp
     out.d_y = v * sp
@@ -108,17 +113,15 @@ def rk4_step(
         lf_s,
         lr_s,
     )
+    
+    # Perform weighted average blending for the definitive integration update
     out = VDeriv()
     out.d_x = (k1.d_x + 2.0 * k2.d_x + 2.0 * k3.d_x + k4.d_x) * DT_SUB_SIX
     out.d_y = (k1.d_y + 2.0 * k2.d_y + 2.0 * k3.d_y + k4.d_y) * DT_SUB_SIX
     out.d_psi = (k1.d_psi + 2.0 * k2.d_psi + 2.0 * k3.d_psi + k4.d_psi) * DT_SUB_SIX
     out.d_v = (k1.d_v + 2.0 * k2.d_v + 2.0 * k3.d_v + k4.d_v) * DT_SUB_SIX
-    out.d_psip = (
-        k1.d_psip + 2.0 * k2.d_psip + 2.0 * k3.d_psip + k4.d_psip
-    ) * DT_SUB_SIX
-    out.d_beta = (
-        k1.d_beta + 2.0 * k2.d_beta + 2.0 * k3.d_beta + k4.d_beta
-    ) * DT_SUB_SIX
+    out.d_psip = (k1.d_psip + 2.0 * k2.d_psip + 2.0 * k3.d_psip + k4.d_psip) * DT_SUB_SIX
+    out.d_beta = (k1.d_beta + 2.0 * k2.d_beta + 2.0 * k3.d_beta + k4.d_beta) * DT_SUB_SIX
     return out
 
 @wp.kernel
@@ -140,7 +143,10 @@ def step_kernel(
     lidar_dirs: wp.array[wp.vec2],
     seed_base: int,
 ):
+    # Retrieve the absolute multi-environment execution lane thread index
     i = wp.tid()
+    
+    # Read core state features from global memory layout into local registers
     x = cars[i, 0]
     y = cars[i, 1]
     delta = cars[i, 2]
@@ -150,6 +156,8 @@ def step_kernel(
     beta = cars[i, 6]
     steps = cars_int[i, 0]
     wp_i = cars_int[i, 1]
+    
+    # Read randomized physical parameters assigned to this lane
     mu_s = car_dr[i, 0]
     mass_s = car_dr[i, 1]
     lf_s = car_dr[i, 2]
@@ -159,30 +167,19 @@ def step_kernel(
     mh = dt_map.shape[1]
     mh_f = wp.float32(mh) - 1.0
 
-    # Input
-    
+    # Parse and safely cap raw policy control outputs
     steer_v = wp.clamp(actions[i][0], -1.0, 1.0) * STEER_V_MAX
     if (steer_v < 0.0 and delta <= STEER_MIN) or (steer_v > 0.0 and delta >= STEER_MAX):
         steer_v = 0.0
+        
     accel = wp.clamp(actions[i][1], -1.0, 1.0) * A_MAX
     if (accel < 0.0 and v <= V_MIN) or (accel > 0.0 and v >= V_MAX):
         accel = 0.0
 
+    # Execute temporal substep tracking loops
     dd_sub = steer_v * DT_SUB
     for _ in range(SUBSTEPS):
-        d = rk4_step(
-            delta,
-            v,
-            psi,
-            psip,
-            beta,
-            steer_v,
-            accel,
-            mu_s,
-            mass_s,
-            lf_s,
-            lr_s,
-        )
+        d = rk4_step(delta, v, psi, psip, beta, steer_v, accel, mu_s, mass_s, lf_s, lr_s)
         x += d.d_x
         y += d.d_y
         delta += dd_sub
@@ -191,19 +188,26 @@ def step_kernel(
         psip += d.d_psip
         beta += d.d_beta
 
+    # Bound operational variables post-integration phase
     delta = wp.clamp(delta, STEER_MIN, STEER_MAX)
     v = wp.clamp(v, V_MIN, V_MAX)
     psip = wp.clamp(psip, -PSI_PRIME_MAX, PSI_PRIME_MAX)
     beta = wp.clamp(beta, -BETA_MAX, BETA_MAX)
 
-    # Reward + done
+    # Convert continuous coordinates to discrete spatial map index locations
     px = wp.clamp(wp.int32((x - origin[0]) / res), 0, mw - 1)
     py = wp.clamp(wp.int32(mh_f - (y - origin[1]) / res), 0, mh - 1)
+    
+    # Look up distance values from the track distance transform field
     edt_val = dt_map[px, py] * res
-    term = edt_val < CAR_HALF_DIAG
+    
+    # Combined standard track boundary failures with numerical stability guards
+    is_stable = wp.isfinite(x) and wp.isfinite(y) and wp.isfinite(v) and wp.isfinite(psi)
+    term = (edt_val < CAR_HALF_DIAG) or (not is_stable)
     trunc = steps >= MAX_STEPS
     steps += 1
 
+    # Extract target progression waypoints
     new_wp = cl_lut[px, py]
     d_wp = new_wp - wp_i
     if 2 * d_wp > n_cl:
@@ -211,6 +215,7 @@ def step_kernel(
     elif 2 * d_wp < -n_cl:
         d_wp += n_cl
 
+    # Compute directional progress velocities and rewards
     cth = centerline[new_wp][2]
     v_along = v * wp.cos(beta + psi - cth)
     progress = (
@@ -223,6 +228,7 @@ def step_kernel(
     term_pen = wp.where(term, -TERM_PENALTY, 0.0)
     reward[i] = progress + term_pen
 
+    # Assign state outcome flags to the shared global status array
     if term:
         done[i] = DONE_TERMINATED
     elif trunc:
@@ -230,10 +236,15 @@ def step_kernel(
     else:
         done[i] = 0
 
-    # Reset
+    # Auto-Reset Logic Block
     if term or trunc:
         rng = wp.rand_init(seed_base + i * 73 + steps * 31 + new_wp * 17)
-        rnd = wp.int32(wp.randf(rng) * wp.float32(n_cl)) % n_cl
+        
+        # Safe random bounding
+        rnd = wp.int32(wp.randf(rng) * wp.float32(n_cl))
+        if rnd >= n_cl:
+            rnd = n_cl - 1
+            
         rpt = centerline[rnd]
         x = rpt[0]
         y = rpt[1]
@@ -244,12 +255,14 @@ def step_kernel(
         beta = 0.0
         steps = 0
         new_wp = rnd
+        
+        # Re-sample domain randomization values for the fresh environment lifecycle
         car_dr[i, 0] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 1] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 2] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
         car_dr[i, 3] = 1.0 - DR_FRAC + 2.0 * DR_FRAC * wp.randf(rng)
 
-    # Lidar
+    # Raymarching-based Lidar Scan Pass
     sh = wp.sin(psi)
     ch = wp.cos(psi)
     lx = x + LF * ch
@@ -258,12 +271,14 @@ def step_kernel(
     lpy = wp.clamp(wp.int32(mh_f - (ly - origin[1]) / res), 0, mh - 1)
     lpos = wp.vec2(wp.float32(lpx), wp.float32(lpy))
     lrange_px = LIDAR_RANGE / res
+    
     for j in range(lidar_dirs.shape[0]):
         ca = lidar_dirs[j][0]
         sa = lidar_dirs[j][1]
         dpx = wp.vec2(ch * ca - sh * sa, -(sh * ca + ch * sa))
         ray = lpos
         dist = float(0.0)
+        
         while dist < lrange_px:
             rx = wp.int32(ray[0])
             ry = wp.int32(ray[1])
@@ -276,32 +291,37 @@ def step_kernel(
                 break
         obs[i, 3 + j] = wp.min(dist, lrange_px) * res
 
-    # Frenet + lookahead
+    # Compute Frenet Tracking Errors
     cpt = centerline[new_wp]
     cx_p = cpt[0]
     cy_p = cpt[1]
     cth_p = cpt[2]
     s_cth = wp.sin(cth_p)
     c_cth = wp.cos(cth_p)
+    
     heading_err = wp.atan2(s_cth * ch - c_cth * sh, c_cth * ch + s_cth * sh)
     lateral_err = -(x - cx_p) * s_cth + (y - cy_p) * c_cth
     obs[i, OBS_FRENET_OFF] = heading_err
     obs[i, OBS_FRENET_OFF + 1] = lateral_err
 
+    # Compute Forward Track Lookahead Steps
     idx = new_wp
     for k in range(NUM_LOOKAHEAD):
         idx += look_step
-        if idx >= n_cl:
-            idx -= n_cl
+        # API FIX: Replaced wp.select with modern wp.where syntax
+        idx = wp.where(idx >= n_cl, idx - n_cl, idx)
+        
         w = centerline[idx]
         dx = w[0] - x
         dy = w[1] - y
         obs[i, OBS_LOOK_OFF + k * 2] = dx * ch + dy * sh
         obs[i, OBS_LOOK_OFF + k * 2 + 1] = -dx * sh + dy * ch
 
+    # Flush local calculations to global memory blocks
     obs[i, 0] = delta
     obs[i, 1] = v
     obs[i, 2] = psip
+    
     cars[i, 0] = x
     cars[i, 1] = y
     cars[i, 2] = delta
@@ -309,5 +329,6 @@ def step_kernel(
     cars[i, 4] = psi
     cars[i, 5] = psip
     cars[i, 6] = beta
+    
     cars_int[i, 0] = steps
     cars_int[i, 1] = new_wp

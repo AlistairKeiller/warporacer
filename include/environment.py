@@ -214,14 +214,8 @@ class Environment:
         self._call += 1
     
     def _sanitize(self) -> None:
-        # Evaluate cars_buf (7 features) instead of obs_buf (heavy lidar arrays)
-        bad: torch.Tensor = ~torch.isfinite(self.cars_buf).all(dim=1)
-        
         # Globally repair any numerical instability markers in-place
+        # (The kernel now sets the 'done' flags for these automatically on-device)
         torch.nan_to_num_(self.obs_buf, nan=0.0, posinf=LIDAR_RANGE, neginf=0.0)
         torch.nan_to_num_(self.cars_buf, nan=0.0, posinf=0.0, neginf=0.0)
         torch.nan_to_num_(self.rew_buf, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # Flag bad environments for truncation resets without stalling execution
-        self._step_counter.masked_fill_(bad, MAX_STEPS)
-        self.done_buf.masked_fill_(bad, DONE_TRUNCATED)
