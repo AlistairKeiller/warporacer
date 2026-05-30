@@ -19,7 +19,7 @@ class Environment:
         self.map_yaml = map_yaml
         self.num_envs = num_envs
         self.seed = seed
-        self.seed_base = seed # Why two versions?
+        self.seed_base = seed 
 
         self.device = wp.get_device()
         self.map = Map(self.map_yaml)
@@ -67,6 +67,10 @@ class Environment:
         self.cars_int_buf = wp.to_torch(self.cars_int)
         self._step_counter = self.cars_int_buf[:, 0]
 
+        # OPTIMIZATION: Pre-allocate boolean masks for step returns
+        self.term_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.obs_buf.device)
+        self.trunc_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.obs_buf.device)
+
         angles = np.linspace(-LIDAR_FOV / 2, LIDAR_FOV / 2, NUM_LIDAR, dtype=np.float32)
         self.lidar_buf = wp.array(
             np.column_stack([np.cos(angles), np.sin(angles)]),
@@ -83,14 +87,20 @@ class Environment:
         self.rew_buf.zero_()
         self.done_buf.zero_()
 
+    @profile
     def step(self, action):
         self._launch(wp.from_torch(action.detach().contiguous(), dtype=wp.vec2))
         self._sanitize()
+        
+        # OPTIMIZATION: In-place update of done masks (Zero memory allocation)
+        torch.eq(self.done_buf, DONE_TERMINATED, out=self.term_buf)
+        torch.eq(self.done_buf, DONE_TRUNCATED, out=self.trunc_buf)
+
         return (
             self.obs_buf,
             self.rew_buf,
-            self.done_buf == DONE_TERMINATED,
-            self.done_buf == DONE_TRUNCATED,
+            self.term_buf,
+            self.trunc_buf,
             {},
         )
     
@@ -143,19 +153,21 @@ class Environment:
                 int(seed),
             ],
         )
-        wp.synchronize_device(self.cars.device)
+        # OPTIMIZATION: Removed wp.synchronize_device(self.cars.device)
+        # This allows Python/PyTorch to stay miles ahead of the GPU execution queue.
         self._call += 1
     
     def _sanitize(self):
-        bad = ~(
-            torch.isfinite(self.obs_buf).all(1) & torch.isfinite(self.cars_buf).all(1)
-        )
-        if not bad.any():
-            return
+        # OPTIMIZATION: No more .any() -> completely eliminates PCIe CPU-GPU synchronization.
+        bad = ~(torch.isfinite(self.obs_buf).all(dim=1) & torch.isfinite(self.cars_buf).all(dim=1))
         
+        # Run nan_to_num_ in-place across the entire tensor. 
+        # GPU memory bandwidth is fast enough that doing this globally is often faster 
+        # than generating intermediate advanced-indexing tensors.
         torch.nan_to_num_(self.obs_buf, nan=0.0, posinf=LIDAR_RANGE, neginf=0.0)
         torch.nan_to_num_(self.cars_buf, nan=0.0, posinf=0.0, neginf=0.0)
         torch.nan_to_num_(self.rew_buf, nan=0.0, posinf=0.0, neginf=0.0)
 
-        self._step_counter[bad] = MAX_STEPS
-        self.done_buf[bad] = DONE_TRUNCATED
+        # Use masked_fill_ for zero-allocation in-place updates based on the 'bad' mask
+        self._step_counter.masked_fill_(bad, MAX_STEPS)
+        self.done_buf.masked_fill_(bad, DONE_TRUNCATED)
