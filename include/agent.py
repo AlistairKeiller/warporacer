@@ -283,7 +283,7 @@ def compute_gae(
         
     return adv_b
 
-#@profile # Need to debug why "final_kl = float(stats["kl"].item())" is so slow
+#git@profile
 def train(
     env: "Environment",
     agent: Agent,
@@ -408,11 +408,11 @@ def train(
         
         n_upd: int = 0
         
+        torch.compiler.cudagraph_mark_step_begin()
         for epoch in range(current_epochs):  
             perm = torch.randperm(B, device=device)
             for start in range(0, B, mb):
                 idx = perm[start : start + mb]
-                torch.compiler.cudagraph_mark_step_begin()
                 
                 pg, v_loss, ent_m, approx_kl, clipfrac = _train_step(
                     agent, opt, scaler, b_obs[idx], b_act[idx], b_logp[idx], 
