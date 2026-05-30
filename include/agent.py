@@ -151,6 +151,7 @@ def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: P
     snap: Dict[str, torch.Tensor] = env.save_state()
     was_training: bool = agent.training
     agent.eval()
+    
     try:
         m: "Map" = env.map
         corners: np.ndarray = np.array(
@@ -162,45 +163,88 @@ def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: P
             ]
         )
 
-        def w2p(x: float, y: float) -> Tuple[int, int]:
-            return int((x - m.ox) / m.res), int(m.h - 1 - (y - m.oy) / m.res)
+        base_frame: np.ndarray = cvtColor(m.raw, COLOR_GRAY2RGB)
 
-        trail: deque = deque(maxlen=300)
+        def w2p_vec(pts: np.ndarray) -> np.ndarray:
+            px = (pts[:, 0] - m.ox) / m.res
+            py = m.h - 1 - (pts[:, 1] - m.oy) / m.res
+            return np.column_stack((px, py)).astype(np.int32)
+
         raw, _ = env.reset()
         obs: torch.Tensor = obs_rms.normalize(raw) if obs_rms else raw
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        with imageio.get_writer(
-            str(out_path), fps=int(1 / DT), macro_block_size=1
-        ) as w:
-            with torch.no_grad():
-                for _ in range(num_steps):
-                    a: torch.Tensor = agent.deterministic(obs)
-                    raw, _, term, trunc, _ = env.step(a)
-                    obs = obs_rms.normalize(raw) if obs_rms else raw
-                    row: List[float] = env.cars_buf[0].tolist()
-                    x, y, psi = row[0], row[1], row[4]
-                    if bool(term[0].item()) or bool(trunc[0].item()):
-                        trail.clear()
-                    trail.append((x, y))
-                    frame: np.ndarray = cvtColor(m.raw, COLOR_GRAY2RGB)
-                    if len(trail) > 1:
-                        polylines(
-                            frame,
-                            [np.array([w2p(*p) for p in trail], dtype=np.int32)],
-                            False,
-                            (0, 200, 0),
-                            2,
-                        )
-                    R: np.ndarray = np.array(
-                        [[np.cos(psi), -np.sin(psi)], [np.sin(psi), np.cos(psi)]]
-                    )
-                    world: np.ndarray = corners @ R.T + (x, y)
-                    fillPoly(
-                        frame,
-                        [np.array([w2p(*p) for p in world], dtype=np.int32)],
-                        (255, 50, 50),
-                    )
-                    w.append_data(frame)
+        
+        # ---------------------------------------------------------
+        # PHASE 1: Pure GPU Simulation
+        # ---------------------------------------------------------
+        device = env.cars_buf.device
+        
+        # FIX 1: Allocate enough space for the FULL tensor row to avoid Advanced Indexing
+        num_features = env.cars_buf.shape[1] 
+        traj_states = torch.empty((num_steps, num_features), dtype=torch.float32, device=device)
+        resets_gpu = torch.empty(num_steps, dtype=torch.bool, device=device)
+
+        with torch.no_grad():
+            for i in range(num_steps):
+                a: torch.Tensor = agent.deterministic(obs)
+                raw, _, term, trunc, _ = env.step(a)
+                obs = obs_rms.normalize(raw) if obs_rms else raw
+                
+                # Fast contiguous memory copy instead of indexing kernel
+                traj_states[i] = env.cars_buf[0]
+                resets_gpu[i] = term[0] | trunc[0]
+
+        # Sync to CPU once
+        full_states_cpu = traj_states.cpu().numpy()
+        resets_cpu = resets_gpu.cpu().numpy()
+
+        # Extract exactly what we need on the CPU side
+        x_arr = full_states_cpu[:, 0]
+        y_arr = full_states_cpu[:, 1]
+        psi_arr = full_states_cpu[:, 4]
+
+        # ---------------------------------------------------------
+        # PHASE 2: Pre-Compute Rendering Math
+        # ---------------------------------------------------------
+        # FIX 2: Vectorize the map transformation for all 10,000 steps instantly
+        centers = np.column_stack((x_arr, y_arr))
+        px_centers = w2p_vec(centers) 
+        
+        # Pre-compute rotation sin/cos for all steps
+        c_arr = np.cos(psi_arr)
+        s_arr = np.sin(psi_arr)
+
+        # ---------------------------------------------------------
+        # PHASE 3: Pure CPU Rendering
+        # ---------------------------------------------------------
+        trail: deque = deque(maxlen=300)
+        
+        with imageio.get_writer(str(out_path), fps=int(1 / DT), macro_block_size=1) as w:
+            for i in range(num_steps):
+                if resets_cpu[i]:
+                    trail.clear()
+                    
+                # The trail now stores raw pixel coordinates directly!
+                trail.append(px_centers[i])
+                
+                frame: np.ndarray = base_frame.copy()
+                
+                if len(trail) > 1:
+                    # Convert deque to array (much faster without the w2p_vec math inside)
+                    polylines(frame, [np.array(trail)], False, (0, 200, 0), 2)
+                    
+                # Build rotation matrix for this specific frame
+                c, s = c_arr[i], s_arr[i]
+                R: np.ndarray = np.array([[c, -s], [s, c]])
+                
+                # Calculate corners
+                world_pts: np.ndarray = corners @ R.T + centers[i]
+                px_world = w2p_vec(world_pts)
+                
+                fillPoly(frame, [px_world], (255, 50, 50))
+                
+                w.append_data(frame)
+
     finally:
         env.restore_state(snap)
         agent.train(was_training)
