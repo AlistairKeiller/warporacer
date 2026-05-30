@@ -413,6 +413,7 @@ def train(
                     ent_coef, max_grad_norm
                 )
 
+                # We MUST use .clone() here to escape CUDAGraph static memory
                 stats["pg"] += pg.clone()
                 stats["v"] += v_loss.clone()
                 stats["ent"] += ent_m.clone()
