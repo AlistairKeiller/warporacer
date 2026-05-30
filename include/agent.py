@@ -283,7 +283,7 @@ def compute_gae(
         
     return adv_b
 
-@profile
+#@profile # Need to debug why "final_kl = float(stats["kl"].item())" is so slow
 def train(
     env: "Environment",
     agent: Agent,
