@@ -82,7 +82,8 @@ def main(
             #     pass
 
 if __name__ == "__main__":
-    run(main)
+    #run(main)
+    main(interactive=False, num_envs=8192, map_yaml=Path(".//maps//berlin.yaml"))
     
     # if os.name == "nt":
     #     main(interactive=False, num_envs=1024, map_yaml=Path(".//maps//berlin.yaml"))

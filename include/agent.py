@@ -1,12 +1,13 @@
+import math
 import time
 from collections import deque
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import imageio.v2 as imageio
 import numpy as np
 import torch
 import torch.nn as nn
-#import wandb
 from cv2 import COLOR_GRAY2RGB, cvtColor, fillPoly, polylines
 from torch.distributions import Normal
 
@@ -14,18 +15,18 @@ from include.constants import *
 
 
 class RunningMeanStd:
-    def __init__(self, shape, device):
-        self.mean = torch.zeros(shape, dtype=torch.float32, device=device)
-        self.var = torch.ones(shape, dtype=torch.float32, device=device)
-        self.inv_std = torch.ones(shape, dtype=torch.float32, device=device)
-        self.count = 1e-4
+    def __init__(self, shape: Tuple[int, ...], device: torch.device) -> None:
+        self.mean: torch.Tensor = torch.zeros(shape, dtype=torch.float32, device=device)
+        self.var: torch.Tensor = torch.ones(shape, dtype=torch.float32, device=device)
+        self.inv_std: torch.Tensor = torch.ones(shape, dtype=torch.float32, device=device)
+        self.count: float = 1e-4
 
-    def update(self, x):
+    def update(self, x: torch.Tensor) -> None:
         x = x.reshape(-1, *self.mean.shape).float()
         bv, bm = torch.var_mean(x, dim=0, unbiased=False)
-        bc = x.shape[0]
-        delta = bm - self.mean
-        tot = self.count + bc
+        bc: int = x.shape[0]
+        delta: torch.Tensor = bm - self.mean
+        tot: float = self.count + bc
         self.mean.add_(delta, alpha=bc / tot)
         self.var = (
             self.var * self.count + bv * bc + delta * delta * (self.count * bc / tot)
@@ -33,103 +34,120 @@ class RunningMeanStd:
         self.count = tot
         self.inv_std = torch.rsqrt(self.var + 1e-8)
 
-    def normalize(self, x, clip: float = 10.0):
+    def normalize(self, x: torch.Tensor, clip: float = 10.0) -> torch.Tensor:
         return ((x - self.mean) * self.inv_std).clamp(-clip, clip)
 
 
 class ReturnNormalizer:
-    def __init__(self, num_envs, gamma, device):
-        self.gamma = gamma
-        self.returns = torch.zeros(num_envs, dtype=torch.float32, device=device)
-        self.rms = RunningMeanStd((), device)
+    def __init__(self, num_envs: int, gamma: float, device: torch.device) -> None:
+        self.gamma: float = gamma
+        self.returns: torch.Tensor = torch.zeros(num_envs, dtype=torch.float32, device=device)
+        self.rms: RunningMeanStd = RunningMeanStd((), device)
 
-    def update(self, reward, done):
+    def update(self, reward: torch.Tensor, done: torch.Tensor) -> None:
         self.returns = self.returns * self.gamma * (1.0 - done) + reward
         self.rms.update(self.returns)
 
-    def normalize(self, reward):
+    def normalize(self, reward: torch.Tensor) -> torch.Tensor:
         return reward * self.rms.inv_std
 
 
-def layer_init(layer, std=np.sqrt(2.0), bias=0.0):
+def layer_init(layer: nn.Linear, std: float = np.sqrt(2.0), bias: float = 0.0) -> nn.Linear:
     nn.init.orthogonal_(layer.weight, std)
     nn.init.constant_(layer.bias, bias)
     return layer
 
 
 class Agent(nn.Module):
-    LOGSTD_MIN, LOGSTD_MAX = -1.6, -0.3
+    LOGSTD_MIN: float = -1.6
+    LOGSTD_MAX: float = -0.3
 
-    def __init__(self, obs_dim=OBS_DIM, act_dim=ACT_DIM, hidden=256):
+    def __init__(self, obs_dim: int = OBS_DIM, act_dim: int = ACT_DIM, hidden: int = 256) -> None:
         super().__init__()
-        self.actor = nn.Sequential(
+        self.actor: nn.Sequential = nn.Sequential(
             layer_init(nn.Linear(obs_dim, hidden)),
             nn.Tanh(),
             layer_init(nn.Linear(hidden, hidden)),
             nn.Tanh(),
             layer_init(nn.Linear(hidden, act_dim), std=0.01),
         )
-        self.critic = nn.Sequential(
+        self.critic: nn.Sequential = nn.Sequential(
             layer_init(nn.Linear(obs_dim, hidden)),
             nn.Tanh(),
             layer_init(nn.Linear(hidden, hidden)),
             nn.Tanh(),
             layer_init(nn.Linear(hidden, 1), std=1.0),
         )
-        self.log_std = nn.Parameter(torch.full((1, act_dim), -0.5))
+        self.log_std: nn.Parameter = nn.Parameter(torch.full((1, act_dim), -0.5))
+        self._compiled: bool = False
 
-    def _dist(self, obs, mean=None):
+    def _dist(self, obs: torch.Tensor, mean: Optional[torch.Tensor] = None) -> Normal:
         if mean is None:
             mean = self.actor(obs)
-        ls = self.log_std.clamp(self.LOGSTD_MIN, self.LOGSTD_MAX)
+        ls: torch.Tensor = self.log_std.clamp(self.LOGSTD_MIN, self.LOGSTD_MAX)
         return Normal(mean, ls.exp())
 
-    def value(self, obs):
+    def value(self, obs: torch.Tensor) -> torch.Tensor:
         return self.critic(obs).squeeze(-1)
 
-    def act_value(self, obs):
-        mean = self.actor(obs)
-        d = self._dist(obs, mean=mean)
-        action = d.sample()
-        return action, d.log_prob(action).sum(-1), d.entropy().sum(-1), self.critic(obs).squeeze(-1)
+    def act_value(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        mean: torch.Tensor = self.actor(obs)
+        ls: torch.Tensor = self.log_std.clamp(self.LOGSTD_MIN, self.LOGSTD_MAX)
+        std: torch.Tensor = ls.exp()
+        
+        noise: torch.Tensor = torch.randn_like(mean)
+        action: torch.Tensor = mean + noise * std
+        
+        var: torch.Tensor = std.pow(2)
+        log_prob: torch.Tensor = -((action - mean) ** 2) / (2 * var) - ls - math.log(math.sqrt(2 * math.pi))
+        log_prob = log_prob.sum(-1)
+        
+        entropy: torch.Tensor = (0.5 + 0.5 * math.log(2 * math.pi) + ls).sum(-1).expand_as(log_prob)
+        
+        return action, log_prob, entropy, self.critic(obs).squeeze(-1)
 
-    def evaluate(self, obs, action):
-        mean = self.actor(obs)
-        d = self._dist(obs, mean=mean)
-        return d.log_prob(action).sum(-1), d.entropy().sum(-1), self.critic(obs).squeeze(-1)
+    def evaluate(self, obs: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mean: torch.Tensor = self.actor(obs)
+        ls: torch.Tensor = self.log_std.clamp(self.LOGSTD_MIN, self.LOGSTD_MAX)
+        var: torch.Tensor = ls.exp().pow(2)
+        
+        log_prob: torch.Tensor = -((action - mean) ** 2) / (2 * var) - ls - math.log(math.sqrt(2 * math.pi))
+        entropy: torch.Tensor = (0.5 + 0.5 * math.log(2 * math.pi) + ls).sum(-1).expand_as(log_prob[:, 0])
+        
+        return log_prob.sum(-1), entropy, self.critic(obs).squeeze(-1)
 
-    def deterministic(self, obs):
+    def deterministic(self, obs: torch.Tensor) -> torch.Tensor:
         return self.actor(obs)
 
 
 class KLAdaptiveLR:
-    def __init__(self, opt, target_kl=0.02, factor=1.5, lr_min=1e-6, lr_max=3e-3):
-        self.opt = opt
-        self.target = target_kl
-        self.factor = factor
-        self.lr_min = lr_min
-        self.lr_max = lr_max
+    def __init__(self, opt: torch.optim.Optimizer, target_kl: float = 0.02, factor: float = 1.5, lr_min: float = 1e-6, lr_max: float = 3e-3) -> None:
+        self.opt: torch.optim.Optimizer = opt
+        self.target: float = target_kl
+        self.factor: float = factor
+        self.lr_min: float = lr_min
+        self.lr_max: float = lr_max
 
-    def step(self, kl):
+    def step(self, kl: float) -> None:
         for pg in self.opt.param_groups:
-            lr = pg["lr"]
+            lr: float = pg["lr"]
             if kl > 2.0 * self.target:
                 pg["lr"] = max(self.lr_min, lr / self.factor)
             elif kl < 0.5 * self.target:
                 pg["lr"] = min(self.lr_max, lr * self.factor)
 
     @property
-    def lr(self):
-        return self.opt.param_groups[0]["lr"]
+    def lr(self) -> float:
+        return float(self.opt.param_groups[0]["lr"])
 
 
-def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
-    snap = env.save_state()
-    was_training = agent.training
+def record_rollout(env: Any, agent: Agent, num_steps: int, out_path: Path, obs_rms: Optional[RunningMeanStd] = None) -> None:
+    snap: Dict[str, torch.Tensor] = env.save_state()
+    was_training: bool = agent.training
     agent.eval()
     try:
-        m = env.map
-        corners = np.array(
+        m: Any = env.map
+        corners: np.ndarray = np.array(
             [
                 [-LENGTH / 2, -WIDTH / 2],
                 [LENGTH / 2, -WIDTH / 2],
@@ -138,27 +156,27 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
             ]
         )
 
-        def w2p(x, y):
+        def w2p(x: float, y: float) -> Tuple[int, int]:
             return int((x - m.ox) / m.res), int(m.h - 1 - (y - m.oy) / m.res)
 
-        trail = deque(maxlen=300)
+        trail: deque = deque(maxlen=300)
         raw, _ = env.reset()
-        obs = obs_rms.normalize(raw) if obs_rms else raw
+        obs: torch.Tensor = obs_rms.normalize(raw) if obs_rms else raw
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with imageio.get_writer(
             str(out_path), fps=int(1 / DT), macro_block_size=1
         ) as w:
             with torch.no_grad():
                 for _ in range(num_steps):
-                    a = agent.deterministic(obs)
+                    a: torch.Tensor = agent.deterministic(obs)
                     raw, _, term, trunc, _ = env.step(a)
                     obs = obs_rms.normalize(raw) if obs_rms else raw
-                    row = env.cars_buf[0].tolist()
+                    row: List[float] = env.cars_buf[0].tolist()
                     x, y, psi = row[0], row[1], row[4]
                     if bool(term[0].item()) or bool(trunc[0].item()):
                         trail.clear()
                     trail.append((x, y))
-                    frame = cvtColor(m.raw, COLOR_GRAY2RGB)
+                    frame: np.ndarray = cvtColor(m.raw, COLOR_GRAY2RGB)
                     if len(trail) > 1:
                         polylines(
                             frame,
@@ -167,10 +185,10 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
                             (0, 200, 0),
                             2,
                         )
-                    R = np.array(
+                    R: np.ndarray = np.array(
                         [[np.cos(psi), -np.sin(psi)], [np.sin(psi), np.cos(psi)]]
                     )
-                    world = corners @ R.T + (x, y)
+                    world: np.ndarray = corners @ R.T + (x, y)
                     fillPoly(
                         frame,
                         [np.array([w2p(*p) for p in world], dtype=np.int32)],
@@ -183,29 +201,44 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
 
 
 @torch.compile(mode="reduce-overhead")
-def _train_step(agent, opt, scaler, b_obs_idx, b_act_idx, b_logp_idx, b_adv_idx, b_ret_idx, b_val_idx, clip, vf_coef, vf_clip, ent_coef, max_grad_norm):
+def _train_step(
+    agent: Agent,
+    opt: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    b_obs_idx: torch.Tensor,
+    b_act_idx: torch.Tensor,
+    b_logp_idx: torch.Tensor,
+    b_adv_idx: torch.Tensor,
+    b_ret_idx: torch.Tensor,
+    b_val_idx: torch.Tensor,
+    clip: float,
+    vf_coef: float,
+    vf_clip: float,
+    ent_coef: float,
+    max_grad_norm: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     with torch.amp.autocast(device_type=b_obs_idx.device.type, dtype=torch.float16):
         new_logp, ent, new_val = agent.evaluate(b_obs_idx, b_act_idx)
         
-        logratio = new_logp - b_logp_idx
-        ratio = logratio.exp()
+        logratio: torch.Tensor = new_logp - b_logp_idx
+        ratio: torch.Tensor = logratio.exp()
         
-        approx_kl = ((ratio - 1.0) - logratio).mean()
-        clipfrac = ((ratio - 1.0).abs() > clip).float().mean()
+        approx_kl: torch.Tensor = ((ratio - 1.0) - logratio).mean()
+        clipfrac: torch.Tensor = ((ratio - 1.0).abs() > clip).float().mean()
         
-        adv_mb = (b_adv_idx - b_adv_idx.mean()) / (b_adv_idx.std() + 1e-8)
-        s1 = ratio * adv_mb
-        s2 = ratio.clamp(1 - clip, 1 + clip) * adv_mb
-        pg = -torch.min(s1, s2).mean()
+        adv_mb: torch.Tensor = (b_adv_idx - b_adv_idx.mean()) / (b_adv_idx.std() + 1e-8)
+        s1: torch.Tensor = ratio * adv_mb
+        s2: torch.Tensor = ratio.clamp(1 - clip, 1 + clip) * adv_mb
+        pg: torch.Tensor = -torch.min(s1, s2).mean()
         
-        v_err = new_val - b_ret_idx
+        v_err: torch.Tensor = new_val - b_ret_idx
         if vf_clip > 0:
-            v_clipped = b_val_idx + (new_val - b_val_idx).clamp(-vf_clip, vf_clip)
-            v_loss = 0.5 * torch.max(v_err.square(), (v_clipped - b_ret_idx).square()).mean()
+            v_clipped: torch.Tensor = b_val_idx + (new_val - b_val_idx).clamp(-vf_clip, vf_clip)
+            v_loss: torch.Tensor = 0.5 * torch.max(v_err.square(), (v_clipped - b_ret_idx).square()).mean()
         else:
             v_loss = 0.5 * v_err.square().mean()
             
-        loss = pg + vf_coef * v_loss - ent_coef * ent.mean()
+        loss: torch.Tensor = pg + vf_coef * v_loss - ent_coef * ent.mean()
 
     opt.zero_grad(set_to_none=True)
     scaler.scale(loss).backward()
@@ -216,59 +249,88 @@ def _train_step(agent, opt, scaler, b_obs_idx, b_act_idx, b_logp_idx, b_adv_idx,
     
     return pg, v_loss, ent.mean(), approx_kl, clipfrac
 
+
+@torch.compile(mode="reduce-overhead", fullgraph=True)
+def compute_gae(
+    rew_b: torch.Tensor,
+    val_b: torch.Tensor,
+    next_val: torch.Tensor,
+    term_b: torch.Tensor,
+    done_b: torch.Tensor,
+    gamma: float,
+    gae_lambda: float,
+    rollouts: int,
+) -> torch.Tensor:
+    adv_b: torch.Tensor = torch.zeros_like(rew_b)
+    last: torch.Tensor = torch.zeros_like(next_val)
+    
+    for t in range(rollouts - 1, -1, -1):
+        nonterm: torch.Tensor = 1.0 - term_b[t]
+        nondone: torch.Tensor = 1.0 - done_b[t]
+        
+        next_v: torch.Tensor = next_val if t == rollouts - 1 else val_b[t + 1]
+        
+        delta: torch.Tensor = rew_b[t] + gamma * next_v * nonterm - val_b[t]
+        last = delta + gamma * gae_lambda * nondone * last
+        adv_b[t] = last
+        
+    return adv_b
+
 @profile
 def train(
-    env,
-    agent,
-    iterations=2000,
-    rollouts=24,
-    epochs=5,
-    minibatches=4,
-    gamma=0.99,
-    gae_lambda=0.95,
-    clip=0.2,
-    vf_clip=0.2,
-    vf_coef=0.5,
-    ent_coef=0.0,
-    max_grad_norm=0.5,
-    lr=3e-4,
-    target_kl=0.02,
-    log_dir=Path("./logs"),
-    record_every=100,
-    record_steps=1800,
-):
-    device = next(agent.parameters()).device
-    N = env.num_envs
-    opt = torch.optim.Adam(agent.parameters(), lr=lr, eps=1e-5)
-    sched = KLAdaptiveLR(opt, target_kl=target_kl)
-    obs_rms = RunningMeanStd((OBS_DIM,), device)
-    ret_rms = ReturnNormalizer(N, gamma, device)
+    env: Any,
+    agent: Agent,
+    iterations: int = 2000,
+    rollouts: int = 24,
+    epochs: int = 5,
+    minibatches: int = 4,
+    gamma: float = 0.99,
+    gae_lambda: float = 0.95,
+    clip: float = 0.2,
+    vf_clip: float = 0.2,
+    vf_coef: float = 0.5,
+    ent_coef: float = 0.0,
+    max_grad_norm: float = 0.5,
+    lr: float = 3e-4,
+    target_kl: float = 0.02,
+    log_dir: Path = Path("./logs"),
+    record_every: int = 100,
+    record_steps: int = 1800,
+) -> Tuple[float, RunningMeanStd, ReturnNormalizer, int]:
+    device: torch.device = next(agent.parameters()).device
+    N: int = env.num_envs
+    opt: torch.optim.Optimizer = torch.optim.Adam(agent.parameters(), lr=lr, eps=1e-5)
+    sched: KLAdaptiveLR = KLAdaptiveLR(opt, target_kl=target_kl)
+    obs_rms: RunningMeanStd = RunningMeanStd((OBS_DIM,), device)
+    ret_rms: ReturnNormalizer = ReturnNormalizer(N, gamma, device)
 
-    if not getattr(agent, "_compiled", False):
+    if not agent._compiled:
         agent.evaluate = torch.compile(agent.evaluate, mode="reduce-overhead")
         agent.act_value = torch.compile(agent.act_value, mode="reduce-overhead")
         agent._compiled = True
 
-    scaler = torch.amp.GradScaler(device=device.type)
+    scaler: torch.amp.GradScaler = torch.amp.GradScaler(device=device.type)
 
-    obs_b = torch.zeros((rollouts, N, OBS_DIM), device=device)
-    act_b = torch.zeros((rollouts, N, ACT_DIM), device=device)
-    logp_b = torch.zeros((rollouts, N), device=device)
-    rew_b = torch.zeros((rollouts, N), device=device)
-    done_b = torch.zeros((rollouts, N), device=device)
-    term_b = torch.zeros((rollouts, N), device=device)
-    val_b = torch.zeros((rollouts, N), device=device)
+    obs_b: torch.Tensor = torch.zeros((rollouts, N, OBS_DIM), device=device)
+    raw_obs_b: torch.Tensor = torch.zeros((rollouts, N, OBS_DIM), device=device)  # Pre-allocated batch update buffer
+    act_b: torch.Tensor = torch.zeros((rollouts, N, ACT_DIM), device=device)
+    logp_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
+    rew_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
+    done_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
+    term_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
+    val_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
 
     raw, _ = env.reset()
     obs_rms.update(raw)
-    obs = obs_rms.normalize(raw)
-    ep_ret = torch.zeros(N, device=device)
-    ep_len = torch.zeros(N, device=device)
-    finished_rets, finished_lens = deque(maxlen=100), deque(maxlen=100)
+    obs: torch.Tensor = obs_rms.normalize(raw)
+    ep_ret: torch.Tensor = torch.zeros(N, device=device)
+    ep_len: torch.Tensor = torch.zeros(N, device=device)
+    finished_rets: deque = deque(maxlen=100)
+    finished_lens: deque = deque(maxlen=100)
 
-    global_step = 0
-    t0 = time.time()
-    last_t = t0
+    global_step: int = 0
+    t0: float = time.time()
+    last_t: float = t0
 
     for it in range(iterations):
         agent.eval()
@@ -280,10 +342,9 @@ def train(
                 logp_b[t] = logp
                 val_b[t] = val
                 raw, raw_rew, term, trunc, _ = env.step(act)
+                raw_obs_b[t] = raw  # Save raw observations to update in a massive single batch later
 
-                # env.vs.render() # Live rendering of training, keep this here for future visuals
-
-                done = (term | trunc).float()
+                done: torch.Tensor = (term | trunc).float()
                 ret_rms.update(raw_rew, done)
                 rew_b[t] = ret_rms.normalize(raw_rew)
                 done_b[t] = done
@@ -291,51 +352,46 @@ def train(
                 ep_ret.add_(raw_rew)
                 ep_len.add_(1.0)
                 
-                fin = done.bool()
+                fin: torch.Tensor = done.bool()
                 if fin.any():
-                    finished_rets.extend(ep_ret[fin].cpu().tolist())
-                    finished_lens.extend(ep_len[fin].cpu().tolist())
+                    # Optimized non-blocking numpy slice transfers
+                    finished_rets.extend(ep_ret[fin].detach().cpu().numpy())
+                    finished_lens.extend(ep_len[fin].detach().cpu().numpy())
                     ep_ret[fin] = 0.0
                     ep_len[fin] = 0.0
-                obs_rms.update(raw)
                 obs = obs_rms.normalize(raw)
-            next_val = agent.value(obs)
+            next_val: torch.Tensor = agent.value(obs)
 
-        # GAE Calculation
-        val_ext = torch.cat([val_b, next_val.unsqueeze(0)], 0)
-        adv_b = torch.zeros_like(rew_b)
-        last = torch.zeros_like(next_val)
-        for t in reversed(range(rollouts)):
-            nonterm = 1.0 - term_b[t]
-            nondone = 1.0 - done_b[t]
-            delta = rew_b[t] + gamma * val_ext[t + 1] * nonterm - val_b[t]
-            last = delta + gamma * gae_lambda * nondone * last
-            adv_b[t] = last
-        ret_b = adv_b + val_b
-        global_step += rollouts * N
+        # Batch update observation parameters outside the rollout collection loop
+        obs_rms.update(raw_obs_b)
+
+        # GAE Calculation - Clone the output to release it from CUDAGraph static memory
+        adv_b: torch.Tensor = compute_gae(rew_b, val_b, next_val, term_b, done_b, gamma, gae_lambda, rollouts).clone()
+        ret_b: torch.Tensor = adv_b + val_b
+        
+        B: int = rollouts * N
+        global_step += B
 
         # Flatten Dataset
-        B = rollouts * N
-        b_obs = obs_b.reshape(B, OBS_DIM)
-        b_act = act_b.reshape(B, ACT_DIM)
-        b_logp = logp_b.reshape(B)
-        b_adv = adv_b.reshape(B)
-        b_ret = ret_b.reshape(B)
-        b_val = val_b.reshape(B)
-        mb = B // minibatches
+        b_obs: torch.Tensor = obs_b.reshape(B, OBS_DIM)
+        b_act: torch.Tensor = act_b.reshape(B, ACT_DIM)
+        b_logp: torch.Tensor = logp_b.reshape(B)
+        b_adv: torch.Tensor = adv_b.reshape(B)
+        b_ret: torch.Tensor = ret_b.reshape(B)
+        b_val: torch.Tensor = val_b.reshape(B)
+        mb: int = B // minibatches
 
         agent.train()
         
-        # Track statistics directly on GPU
-        stats = {
+        stats: Dict[str, torch.Tensor] = {
             "pg": torch.tensor(0.0, device=device),
             "v": torch.tensor(0.0, device=device),
             "ent": torch.tensor(0.0, device=device),
             "kl": torch.tensor(0.0, device=device),
             "clipfrac": torch.tensor(0.0, device=device)
         }
-        n_upd = 0
-        kl_stop = False
+        n_upd: int = 0
+        kl_stop: bool = False
         
         for epoch in range(epochs):
             perm = torch.randperm(B, device=device)
@@ -345,44 +401,42 @@ def train(
 
                 torch.compiler.cudagraph_mark_step_begin()
 
-                # UTILITY FIX: Call compiled `_train_step` rather than raw rewriting
                 pg, v_loss, ent_m, approx_kl, clipfrac = _train_step(
                     agent, opt, scaler, b_obs[idx], b_act[idx], b_logp[idx], 
                     b_adv[idx], b_ret[idx], b_val[idx], clip, vf_coef, vf_clip, 
                     ent_coef, max_grad_norm
                 )
 
-                epoch_kl += approx_kl
-                stats["pg"] += pg
-                stats["v"] += v_loss
-                stats["ent"] += ent_m
-                stats["kl"] += approx_kl
-                stats["clipfrac"] += clipfrac
+                # Clone the CUDAGraph outputs to prevent memory overwrites
+                epoch_kl += approx_kl.clone()
+                stats["pg"] += pg.clone()
+                stats["v"] += v_loss.clone()
+                stats["ent"] += ent_m.clone()
+                stats["kl"] += approx_kl.clone()
+                stats["clipfrac"] += clipfrac.clone()
                 n_upd += 1
                 
-            # Early stopping criteria evaluated via a single device check per epoch loop
             if (epoch_kl.item() / max(minibatches, 1)) > 1.5 * target_kl:
                 kl_stop = True
                 break
                 
-        # Resolve metrics collectively back to host
         for k in stats:
-            stats[k] = (stats[k] / max(n_upd, 1)).item()
+            stats[k] = torch.tensor(stats[k].item() / max(n_upd, 1))
             
-        sched.step(stats["kl"])
+        sched.step(float(stats["kl"].item()))
 
-        now = time.time()
-        sps = int(rollouts * N / max(now - last_t, 1e-9))
+        now: float = time.time()
+        sps: int = int(rollouts * N / max(now - last_t, 1e-9))
         last_t = now
-        log = {
-            "policy_loss": stats["pg"],
-            "value_loss": stats["v"],
-            "entropy": stats["ent"],
-            "approx_kl": stats["kl"],
-            "clipfrac": stats["clipfrac"],
+        log: Dict[str, Any] = {
+            "policy_loss": stats["pg"].item(),
+            "value_loss": stats["v"].item(),
+            "entropy": stats["ent"].item(),
+            "approx_kl": stats["kl"].item(),
+            "clipfrac": stats["clipfrac"].item(),
             "kl_stop": int(kl_stop),
             "log_std": agent.log_std.mean().item(),
-            "lr": sched.lr,
+            "iter_lr": sched.lr,
             "sps": sps,
             "iteration": it,
         }
@@ -390,17 +444,17 @@ def train(
             log["ep_return"] = float(np.mean(finished_rets))
             log["ep_length"] = float(np.mean(finished_lens))
 
-        print(f"wandb.log: global_step={global_step}")
+        print(f"{time.time()}: wandb.log: global_step={global_step}")
 
         if it % 10 == 0:
-            er = log.get("ep_return", float("nan"))
+            er: float = log.get("ep_return", float("nan"))
             print(
                 f"[it {it:4d}] step={global_step:>9d} sps={sps:>6d} "
-                f"ret={er:8.2f} kl={stats['kl']:.4f} lr={sched.lr:.2e}"
+                f"ret={er:8.2f} kl={stats['kl'].item():.4f} lr={sched.lr:.2e}"
                 f"{' KL-STOP' if kl_stop else ''}"
             )
         if record_every > 0 and (it + 1) % record_every == 0:
-            out = log_dir / f"rollout_iter{it + 1:06d}.mp4"
+            out: Path = log_dir / f"rollout_iter{it + 1:06d}.mp4"
             print(f"record_rollout: out={out}")
             record_rollout(env, agent, record_steps, out, obs_rms)
             
