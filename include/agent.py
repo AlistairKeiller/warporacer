@@ -13,6 +13,9 @@ from torch.distributions import Normal
 
 from include.constants import *
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 
 class RunningMeanStd:
     def __init__(self, shape: Tuple[int, ...], device: torch.device) -> None:
@@ -217,7 +220,8 @@ def _train_step(
     ent_coef: float,
     max_grad_norm: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    with torch.amp.autocast(device_type=b_obs_idx.device.type, dtype=torch.float16):
+    # Hardcode "cuda" to prevent graph breaks from checking tensor attributes
+    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
         new_logp, ent, new_val = agent.evaluate(b_obs_idx, b_act_idx)
         
         logratio: torch.Tensor = new_logp - b_logp_idx
@@ -276,6 +280,7 @@ def compute_gae(
         
     return adv_b
 
+
 @profile
 def train(
     env: Any,
@@ -299,7 +304,9 @@ def train(
 ) -> Tuple[float, RunningMeanStd, ReturnNormalizer, int]:
     device: torch.device = next(agent.parameters()).device
     N: int = env.num_envs
-    opt: torch.optim.Optimizer = torch.optim.Adam(agent.parameters(), lr=lr, eps=1e-5)
+    
+    # Enable Fused Adam for massive CPU overhead reduction
+    opt: torch.optim.Optimizer = torch.optim.Adam(agent.parameters(), lr=lr, eps=1e-5, fused=True)
     sched: KLAdaptiveLR = KLAdaptiveLR(opt, target_kl=target_kl)
     obs_rms: RunningMeanStd = RunningMeanStd((OBS_DIM,), device)
     ret_rms: ReturnNormalizer = ReturnNormalizer(N, gamma, device)
@@ -309,10 +316,10 @@ def train(
         agent.act_value = torch.compile(agent.act_value, mode="reduce-overhead")
         agent._compiled = True
 
-    scaler: torch.amp.GradScaler = torch.amp.GradScaler(device=device.type)
+    scaler: torch.amp.GradScaler = torch.amp.GradScaler("cuda")
 
     obs_b: torch.Tensor = torch.zeros((rollouts, N, OBS_DIM), device=device)
-    raw_obs_b: torch.Tensor = torch.zeros((rollouts, N, OBS_DIM), device=device)  # Pre-allocated batch update buffer
+    raw_obs_b: torch.Tensor = torch.zeros((rollouts, N, OBS_DIM), device=device)
     act_b: torch.Tensor = torch.zeros((rollouts, N, ACT_DIM), device=device)
     logp_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
     rew_b: torch.Tensor = torch.zeros((rollouts, N), device=device)
@@ -342,7 +349,7 @@ def train(
                 logp_b[t] = logp
                 val_b[t] = val
                 raw, raw_rew, term, trunc, _ = env.step(act)
-                raw_obs_b[t] = raw  # Save raw observations to update in a massive single batch later
+                raw_obs_b[t] = raw 
 
                 done: torch.Tensor = (term | trunc).float()
                 ret_rms.update(raw_rew, done)
@@ -354,7 +361,6 @@ def train(
                 
                 fin: torch.Tensor = done.bool()
                 if fin.any():
-                    # Optimized non-blocking numpy slice transfers
                     finished_rets.extend(ep_ret[fin].detach().cpu().numpy())
                     finished_lens.extend(ep_len[fin].detach().cpu().numpy())
                     ep_ret[fin] = 0.0
@@ -362,17 +368,15 @@ def train(
                 obs = obs_rms.normalize(raw)
             next_val: torch.Tensor = agent.value(obs)
 
-        # Batch update observation parameters outside the rollout collection loop
         obs_rms.update(raw_obs_b)
 
-        # GAE Calculation - Clone the output to release it from CUDAGraph static memory
+        # GAE Calculation - We MUST use .clone() here to escape CUDAGraph static memory
         adv_b: torch.Tensor = compute_gae(rew_b, val_b, next_val, term_b, done_b, gamma, gae_lambda, rollouts).clone()
         ret_b: torch.Tensor = adv_b + val_b
         
         B: int = rollouts * N
         global_step += B
 
-        # Flatten Dataset
         b_obs: torch.Tensor = obs_b.reshape(B, OBS_DIM)
         b_act: torch.Tensor = act_b.reshape(B, ACT_DIM)
         b_logp: torch.Tensor = logp_b.reshape(B)
@@ -401,13 +405,14 @@ def train(
 
                 torch.compiler.cudagraph_mark_step_begin()
 
+                # Removed the profiler block entirely for production speed
                 pg, v_loss, ent_m, approx_kl, clipfrac = _train_step(
                     agent, opt, scaler, b_obs[idx], b_act[idx], b_logp[idx], 
                     b_adv[idx], b_ret[idx], b_val[idx], clip, vf_coef, vf_clip, 
                     ent_coef, max_grad_norm
                 )
 
-                # Clone the CUDAGraph outputs to prevent memory overwrites
+                # MUST use .clone() to safely extract metrics from the static buffer
                 epoch_kl += approx_kl.clone()
                 stats["pg"] += pg.clone()
                 stats["v"] += v_loss.clone()
@@ -416,6 +421,8 @@ def train(
                 stats["clipfrac"] += clipfrac.clone()
                 n_upd += 1
                 
+            # The .item() here forces a CPU-GPU sync. Since it's only once per epoch, 
+            # it is acceptable for early stopping, but be aware of it.
             if (epoch_kl.item() / max(minibatches, 1)) > 1.5 * target_kl:
                 kl_stop = True
                 break
@@ -428,6 +435,7 @@ def train(
         now: float = time.time()
         sps: int = int(rollouts * N / max(now - last_t, 1e-9))
         last_t = now
+        
         log: Dict[str, Any] = {
             "policy_loss": stats["pg"].item(),
             "value_loss": stats["v"].item(),
@@ -444,8 +452,6 @@ def train(
             log["ep_return"] = float(np.mean(finished_rets))
             log["ep_length"] = float(np.mean(finished_lens))
 
-        print(f"{time.time()}: wandb.log: global_step={global_step}")
-
         if it % 10 == 0:
             er: float = log.get("ep_return", float("nan"))
             print(
@@ -455,7 +461,6 @@ def train(
             )
         if record_every > 0 and (it + 1) % record_every == 0:
             out: Path = log_dir / f"rollout_iter{it + 1:06d}.mp4"
-            print(f"record_rollout: out={out}")
             record_rollout(env, agent, record_steps, out, obs_rms)
             
     return time.time() - t0, obs_rms, ret_rms, global_step
