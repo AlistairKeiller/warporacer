@@ -12,6 +12,8 @@ from cv2 import COLOR_GRAY2RGB, cvtColor, fillPoly, polylines
 from torch.distributions import Normal
 
 from include.constants import *
+from include.environment import Environment
+from include.map import Map
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -144,12 +146,12 @@ class KLAdaptiveLR:
         return float(self.opt.param_groups[0]["lr"])
 
 
-def record_rollout(env: Any, agent: Agent, num_steps: int, out_path: Path, obs_rms: Optional[RunningMeanStd] = None) -> None:
+def record_rollout(env: "Environment", agent: Agent, num_steps: int, out_path: Path, obs_rms: Optional[RunningMeanStd] = None) -> None:
     snap: Dict[str, torch.Tensor] = env.save_state()
     was_training: bool = agent.training
     agent.eval()
     try:
-        m: Any = env.map
+        m: "Map" = env.map
         corners: np.ndarray = np.array(
             [
                 [-LENGTH / 2, -WIDTH / 2],
@@ -281,9 +283,8 @@ def compute_gae(
     return adv_b
 
 
-@profile
 def train(
-    env: Any,
+    env: "Environment",
     agent: Agent,
     iterations: int = 2000,
     rollouts: int = 24,
@@ -338,6 +339,9 @@ def train(
     global_step: int = 0
     t0: float = time.time()
     last_t: float = t0
+    
+    # Initialize dynamic epochs
+    current_epochs: int = epochs
 
     for it in range(iterations):
         agent.eval()
@@ -394,43 +398,44 @@ def train(
             "kl": torch.tensor(0.0, device=device),
             "clipfrac": torch.tensor(0.0, device=device)
         }
-        n_upd: int = 0
-        kl_stop: bool = False
         
-        for epoch in range(epochs):
+        n_upd: int = 0
+        
+        for epoch in range(current_epochs):  
             perm = torch.randperm(B, device=device)
-            epoch_kl = torch.tensor(0.0, device=device)
             for start in range(0, B, mb):
                 idx = perm[start : start + mb]
-
                 torch.compiler.cudagraph_mark_step_begin()
-
-                # Removed the profiler block entirely for production speed
+                
                 pg, v_loss, ent_m, approx_kl, clipfrac = _train_step(
                     agent, opt, scaler, b_obs[idx], b_act[idx], b_logp[idx], 
                     b_adv[idx], b_ret[idx], b_val[idx], clip, vf_coef, vf_clip, 
                     ent_coef, max_grad_norm
                 )
 
-                # MUST use .clone() to safely extract metrics from the static buffer
-                epoch_kl += approx_kl.clone()
                 stats["pg"] += pg.clone()
                 stats["v"] += v_loss.clone()
                 stats["ent"] += ent_m.clone()
                 stats["kl"] += approx_kl.clone()
                 stats["clipfrac"] += clipfrac.clone()
                 n_upd += 1
+
+            #env.vs.render() # Live rendering of training
                 
-            # The .item() here forces a CPU-GPU sync. Since it's only once per epoch, 
-            # it is acceptable for early stopping, but be aware of it.
-            if (epoch_kl.item() / max(minibatches, 1)) > 1.5 * target_kl:
-                kl_stop = True
-                break
-                
+        divisor = max(n_upd, 1)
         for k in stats:
-            stats[k] = torch.tensor(stats[k].item() / max(n_upd, 1))
+            stats[k] = stats[k] / divisor  # Vectorized division, stays on the GPU
             
-        sched.step(float(stats["kl"].item()))
+        final_kl = float(stats["kl"].item())
+        sched.step(final_kl)
+        
+        # Dynamic Epoch Logic
+        if final_kl > 1.5 * target_kl:
+            # We drifted too far. Do fewer epochs next time.
+            current_epochs = max(1, current_epochs - 1)
+        elif final_kl < target_kl / 1.5:
+            # Cap the max epochs at your initial default (epochs variable) instead of 10
+            current_epochs = min(epochs, current_epochs + 1)
 
         now: float = time.time()
         sps: int = int(rollouts * N / max(now - last_t, 1e-9))
@@ -440,9 +445,9 @@ def train(
             "policy_loss": stats["pg"].item(),
             "value_loss": stats["v"].item(),
             "entropy": stats["ent"].item(),
-            "approx_kl": stats["kl"].item(),
+            "approx_kl": final_kl,
             "clipfrac": stats["clipfrac"].item(),
-            "kl_stop": int(kl_stop),
+            "current_epochs": current_epochs,  # Replaced kl_stop with current_epochs
             "log_std": agent.log_std.mean().item(),
             "iter_lr": sched.lr,
             "sps": sps,
@@ -452,15 +457,20 @@ def train(
             log["ep_return"] = float(np.mean(finished_rets))
             log["ep_length"] = float(np.mean(finished_lens))
 
+        # Restored wandb debug print
+        #print(f"wandb.log: global_step={global_step}")
+
         if it % 10 == 0:
             er: float = log.get("ep_return", float("nan"))
+            # Removed kl_stop conditional from this print statement
             print(
                 f"[it {it:4d}] step={global_step:>9d} sps={sps:>6d} "
-                f"ret={er:8.2f} kl={stats['kl'].item():.4f} lr={sched.lr:.2e}"
-                f"{' KL-STOP' if kl_stop else ''}"
+                f"ret={er:8.2f} kl={final_kl:.4f} lr={sched.lr:.2e} epochs={current_epochs}"
             )
+            
         if record_every > 0 and (it + 1) % record_every == 0:
             out: Path = log_dir / f"rollout_iter{it + 1:06d}.mp4"
+            print(f"record_rollout: out={out}")
             record_rollout(env, agent, record_steps, out, obs_rms)
             
     return time.time() - t0, obs_rms, ret_rms, global_step
