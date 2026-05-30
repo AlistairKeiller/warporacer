@@ -78,19 +78,25 @@ class Agent(nn.Module):
         )
         self.log_std = nn.Parameter(torch.full((1, act_dim), -0.5))
 
-    def _dist(self, obs):
-        mean = self.actor(obs)
-        ls = self.log_std.expand_as(mean).clamp(self.LOGSTD_MIN, self.LOGSTD_MAX)
+    def _dist(self, obs, mean=None):
+        if mean is None:
+            mean = self.actor(obs)
+        ls = self.log_std.clamp(self.LOGSTD_MIN, self.LOGSTD_MAX)
         return Normal(mean, ls.exp())
 
     def value(self, obs):
         return self.critic(obs).squeeze(-1)
 
-    def act_value(self, obs, action=None):
-        d = self._dist(obs)
-        if action is None:
-            action = d.sample()
-        return action, d.log_prob(action).sum(-1), d.entropy().sum(-1), self.value(obs)
+    def act_value(self, obs):
+        mean = self.actor(obs)
+        d = self._dist(obs, mean=mean)
+        action = d.sample()
+        return action, d.log_prob(action).sum(-1), d.entropy().sum(-1), self.critic(obs).squeeze(-1)
+
+    def evaluate(self, obs, action):
+        mean = self.actor(obs)
+        d = self._dist(obs, mean=mean)
+        return d.log_prob(action).sum(-1), d.entropy().sum(-1), self.critic(obs).squeeze(-1)
 
     def deterministic(self, obs):
         return self.actor(obs)
@@ -117,8 +123,6 @@ class KLAdaptiveLR:
         return self.opt.param_groups[0]["lr"]
 
 
-# Rollout video
-# TODO: Implement this in Warp Render instead
 def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
     snap = env.save_state()
     was_training = agent.training
@@ -178,7 +182,41 @@ def record_rollout(env, agent, num_steps, out_path, obs_rms=None):
         agent.train(was_training)
 
 
-# PPO training
+@torch.compile(mode="reduce-overhead")
+def _train_step(agent, opt, scaler, b_obs_idx, b_act_idx, b_logp_idx, b_adv_idx, b_ret_idx, b_val_idx, clip, vf_coef, vf_clip, ent_coef, max_grad_norm):
+    with torch.amp.autocast(device_type=b_obs_idx.device.type, dtype=torch.float16):
+        new_logp, ent, new_val = agent.evaluate(b_obs_idx, b_act_idx)
+        
+        logratio = new_logp - b_logp_idx
+        ratio = logratio.exp()
+        
+        approx_kl = ((ratio - 1.0) - logratio).mean()
+        clipfrac = ((ratio - 1.0).abs() > clip).float().mean()
+        
+        adv_mb = (b_adv_idx - b_adv_idx.mean()) / (b_adv_idx.std() + 1e-8)
+        s1 = ratio * adv_mb
+        s2 = ratio.clamp(1 - clip, 1 + clip) * adv_mb
+        pg = -torch.min(s1, s2).mean()
+        
+        v_err = new_val - b_ret_idx
+        if vf_clip > 0:
+            v_clipped = b_val_idx + (new_val - b_val_idx).clamp(-vf_clip, vf_clip)
+            v_loss = 0.5 * torch.max(v_err.square(), (v_clipped - b_ret_idx).square()).mean()
+        else:
+            v_loss = 0.5 * v_err.square().mean()
+            
+        loss = pg + vf_coef * v_loss - ent_coef * ent.mean()
+
+    opt.zero_grad(set_to_none=True)
+    scaler.scale(loss).backward()
+    scaler.unscale_(opt)
+    torch.nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
+    scaler.step(opt)
+    scaler.update()
+    
+    return pg, v_loss, ent.mean(), approx_kl, clipfrac
+
+@profile
 def train(
     env,
     agent,
@@ -205,6 +243,13 @@ def train(
     sched = KLAdaptiveLR(opt, target_kl=target_kl)
     obs_rms = RunningMeanStd((OBS_DIM,), device)
     ret_rms = ReturnNormalizer(N, gamma, device)
+
+    if not getattr(agent, "_compiled", False):
+        agent.evaluate = torch.compile(agent.evaluate, mode="reduce-overhead")
+        agent.act_value = torch.compile(agent.act_value, mode="reduce-overhead")
+        agent._compiled = True
+
+    scaler = torch.amp.GradScaler(device=device.type)
 
     obs_b = torch.zeros((rollouts, N, OBS_DIM), device=device)
     act_b = torch.zeros((rollouts, N, ACT_DIM), device=device)
@@ -235,7 +280,9 @@ def train(
                 logp_b[t] = logp
                 val_b[t] = val
                 raw, raw_rew, term, trunc, _ = env.step(act)
-                env.vs.render() # Live rendering of training
+
+                # env.vs.render() # Live rendering of training, keep this here for future visuals
+
                 done = (term | trunc).float()
                 ret_rms.update(raw_rew, done)
                 rew_b[t] = ret_rms.normalize(raw_rew)
@@ -243,6 +290,7 @@ def train(
                 term_b[t] = term.float()
                 ep_ret.add_(raw_rew)
                 ep_len.add_(1.0)
+                
                 fin = done.bool()
                 if fin.any():
                     finished_rets.extend(ep_ret[fin].cpu().tolist())
@@ -253,7 +301,7 @@ def train(
                 obs = obs_rms.normalize(raw)
             next_val = agent.value(obs)
 
-        # GAE
+        # GAE Calculation
         val_ext = torch.cat([val_b, next_val.unsqueeze(0)], 0)
         adv_b = torch.zeros_like(rew_b)
         last = torch.zeros_like(next_val)
@@ -266,7 +314,7 @@ def train(
         ret_b = adv_b + val_b
         global_step += rollouts * N
 
-        # Flatten
+        # Flatten Dataset
         B = rollouts * N
         b_obs = obs_b.reshape(B, OBS_DIM)
         b_act = act_b.reshape(B, ACT_DIM)
@@ -277,59 +325,50 @@ def train(
         mb = B // minibatches
 
         agent.train()
-        stats = {"pg": 0.0, "v": 0.0, "ent": 0.0, "kl": 0.0, "clipfrac": 0.0}
+        
+        # Track statistics directly on GPU
+        stats = {
+            "pg": torch.tensor(0.0, device=device),
+            "v": torch.tensor(0.0, device=device),
+            "ent": torch.tensor(0.0, device=device),
+            "kl": torch.tensor(0.0, device=device),
+            "clipfrac": torch.tensor(0.0, device=device)
+        }
         n_upd = 0
         kl_stop = False
+        
         for epoch in range(epochs):
             perm = torch.randperm(B, device=device)
-            epoch_kl = 0.0
+            epoch_kl = torch.tensor(0.0, device=device)
             for start in range(0, B, mb):
                 idx = perm[start : start + mb]
-                _, new_logp, ent, new_val = agent.act_value(b_obs[idx], b_act[idx])
-                logratio = new_logp - b_logp[idx]
-                ratio = logratio.exp()
-                with torch.no_grad():
-                    approx_kl = ((ratio - 1.0) - logratio).mean().item()
-                    clipfrac = ((ratio - 1.0).abs() > clip).float().mean().item()
-                epoch_kl += approx_kl
-                adv_mb = b_adv[idx]
-                adv_mb = (adv_mb - adv_mb.mean()) / (adv_mb.std() + 1e-8)
-                s1 = ratio * adv_mb
-                s2 = ratio.clamp(1 - clip, 1 + clip) * adv_mb
-                pg = -torch.min(s1, s2).mean()
 
-                v_err = new_val - b_ret[idx]
-                if vf_clip > 0:
-                    v_clipped = b_val[idx] + (new_val - b_val[idx]).clamp(
-                        -vf_clip, vf_clip
-                    )
-                    v_loss = (
-                        0.5
-                        * torch.max(
-                            v_err.square(), (v_clipped - b_ret[idx]).square()
-                        ).mean()
-                    )
-                else:
-                    v_loss = 0.5 * v_err.square().mean()
-                ent_m = ent.mean()
-                loss = pg + vf_coef * v_loss - ent_coef * ent_m
-                opt.zero_grad(set_to_none=True)
-                loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
-                opt.step()
-                with torch.no_grad():
-                    agent.log_std.clamp_(Agent.LOGSTD_MIN, Agent.LOGSTD_MAX)
-                stats["pg"] += pg.item()
-                stats["v"] += v_loss.item()
-                stats["ent"] += ent_m.item()
+                torch.compiler.cudagraph_mark_step_begin()
+
+                # UTILITY FIX: Call compiled `_train_step` rather than raw rewriting
+                pg, v_loss, ent_m, approx_kl, clipfrac = _train_step(
+                    agent, opt, scaler, b_obs[idx], b_act[idx], b_logp[idx], 
+                    b_adv[idx], b_ret[idx], b_val[idx], clip, vf_coef, vf_clip, 
+                    ent_coef, max_grad_norm
+                )
+
+                epoch_kl += approx_kl
+                stats["pg"] += pg
+                stats["v"] += v_loss
+                stats["ent"] += ent_m
                 stats["kl"] += approx_kl
                 stats["clipfrac"] += clipfrac
                 n_upd += 1
-            if epoch_kl / max(minibatches, 1) > 1.5 * target_kl:
+                
+            # Early stopping criteria evaluated via a single device check per epoch loop
+            if (epoch_kl.item() / max(minibatches, 1)) > 1.5 * target_kl:
                 kl_stop = True
                 break
+                
+        # Resolve metrics collectively back to host
         for k in stats:
-            stats[k] /= max(n_upd, 1)
+            stats[k] = (stats[k] / max(n_upd, 1)).item()
+            
         sched.step(stats["kl"])
 
         now = time.time()
@@ -352,11 +391,6 @@ def train(
             log["ep_length"] = float(np.mean(finished_lens))
 
         print(f"wandb.log: global_step={global_step}")
-        # TODO: Implement W&B
-        # try:
-        #     wandb.log(log, step=global_step)
-        # except Exception:
-        #     pass
 
         if it % 10 == 0:
             er = log.get("ep_return", float("nan"))
@@ -368,12 +402,6 @@ def train(
         if record_every > 0 and (it + 1) % record_every == 0:
             out = log_dir / f"rollout_iter{it + 1:06d}.mp4"
             print(f"record_rollout: out={out}")
-            # TODO: Implement W&B
-            # try:
-            #     record_rollout(env, agent, record_steps, out, obs_rms=obs_rms)
-            #     wandb.log(
-            #         {"rollout": wandb.Video(str(out), format="mp4")}, step=global_step
-            #     )
-            # except Exception as e:
-            #     print(f"[rollout {it + 1}] failed: {e}")
+            record_rollout(env, agent, record_steps, out, obs_rms)
+            
     return time.time() - t0, obs_rms, ret_rms, global_step

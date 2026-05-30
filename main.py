@@ -49,7 +49,7 @@ def main(
         if interactive:
             env.vs.interactive_render_loop()
         else:
-            agent = Agent(obs_dim=OBS_DIM).to(str(env.device))
+            agent = torch.compile(Agent(obs_dim=OBS_DIM).to(str(env.device)))
             elapsed, obs_rms, ret_rms, step = train(
                 env,
                 agent,
@@ -82,8 +82,11 @@ def main(
             #     pass
 
 if __name__ == "__main__":
-    #run(main)
-    if os.name == "nt":
-        main(interactive=False, num_envs=1024, map_yaml=Path(".//maps//berlin.yaml"))
-    else:
-        main(interactive=False, num_envs=1024, map_yaml=Path("./maps/berlin.yaml"))
+    run(main)
+    
+    # if os.name == "nt":
+    #     main(interactive=False, num_envs=1024, map_yaml=Path(".//maps//berlin.yaml"))
+    # else:
+    #     main(interactive=False, num_envs=1024, map_yaml=Path("./maps/berlin.yaml"))
+
+# env.vs.render() # Live rendering of training
