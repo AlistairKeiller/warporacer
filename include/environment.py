@@ -8,6 +8,9 @@ from include.constants import *
 from include.map import Map
 from include.warped_functions import step_kernel
 
+from typing import TYPE_CHECKING # Forward declaration
+if TYPE_CHECKING:
+    from include.visuals import Visuals
 
 class Environment:
     # Class attribute type annotations
@@ -71,7 +74,7 @@ class Environment:
         # Initialize core physics tracking variables
         self._init_cars()
 
-        # LAZY IMPORT: Keeps visuals.py (and pyglet) completely dormant unless requested
+        # Lazy import to keep visuals.py (and pyglet) completely dormant unless requested for Linux machines
         if self.live_viewer:
             from include.visuals import Visuals
             self.vs = Visuals(self, self.map)

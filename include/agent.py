@@ -283,7 +283,7 @@ def compute_gae(
         
     return adv_b
 
-
+@profile
 def train(
     env: "Environment",
     agent: Agent,
