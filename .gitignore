@@ -13,3 +13,5 @@ logs/
 wandb/
 *.log
 imgui.ini
+main.py.prof
+main.py.lprof
