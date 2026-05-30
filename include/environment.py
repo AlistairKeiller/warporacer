@@ -6,7 +6,6 @@ import warp as wp
 
 from include.constants import *
 from include.map import Map
-from include.visuals import Visuals
 from include.warped_functions import step_kernel
 
 
@@ -72,8 +71,12 @@ class Environment:
         # Initialize core physics tracking variables
         self._init_cars()
 
+        # LAZY IMPORT: Keeps visuals.py (and pyglet) completely dormant unless requested
         if self.live_viewer:
+            from include.visuals import Visuals
             self.vs = Visuals(self, self.map)
+        else:
+            self.vs = None
 
     def _init_cars(self) -> None:
         self.look_step = self.map.look_step
